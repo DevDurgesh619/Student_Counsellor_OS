@@ -1,0 +1,29 @@
+{
+  "name": "@wgc/calendar-sync",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx watch --env-file=../../.env src/index.ts",
+    "start": "node dist/index.js",
+    "lint": "echo 'no lint configured yet' && exit 0",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@wgc/config": "workspace:*",
+    "@wgc/db": "workspace:*",
+    "@wgc/shared": "workspace:*",
+    "drizzle-orm": "^0.36.0",
+    "googleapis": "^144.0.0",
+    "pino": "^9.5.0",
+    "pino-pretty": "^11.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.6",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.4"
+  }
+}

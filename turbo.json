@@ -1,0 +1,42 @@
+{
+  "$schema": "https://turbo.build/schema.json",
+  "ui": "tui",
+  "globalDependencies": ["**/.env.*local", ".env"],
+  "globalEnv": [
+    "NODE_ENV",
+    "DATABASE_URL",
+    "NEXT_PUBLIC_SUPABASE_URL",
+    "NEXT_PUBLIC_SUPABASE_ANON_KEY",
+    "SUPABASE_SERVICE_ROLE_KEY",
+    "WGC_LOG_LEVEL",
+    "WGC_ANTHROPIC_API_KEY",
+    "WGC_OPENAI_API_KEY",
+    "WGC_POSTMARK_API_KEY",
+    "WGC_GOOGLE_VISION_KEY",
+    "WGC_GOOGLE_CALENDAR_CLIENT_ID",
+    "WGC_GOOGLE_CALENDAR_CLIENT_SECRET",
+    "WGC_SPINACH_WEBHOOK_SECRET",
+    "WGC_SENTRY_DSN"
+  ],
+  "tasks": {
+    "build": {
+      "dependsOn": ["^build"],
+      "outputs": ["dist/**", ".next/**", "!.next/cache/**"]
+    },
+    "dev": {
+      "cache": false,
+      "persistent": true
+    },
+    "lint": {
+      "outputs": []
+    },
+    "typecheck": {
+      "dependsOn": ["^build"],
+      "outputs": []
+    },
+    "test": {
+      "dependsOn": ["^build"],
+      "outputs": ["coverage/**"]
+    }
+  }
+}

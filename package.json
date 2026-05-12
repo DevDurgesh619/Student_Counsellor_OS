@@ -1,0 +1,39 @@
+{
+  "name": "wgc-platform",
+  "version": "0.1.0",
+  "private": true,
+  "description": "WGC Student Operating Platform — monorepo root.",
+  "engines": {
+    "node": ">=20.18.0",
+    "pnpm": ">=9.0.0"
+  },
+  "packageManager": "pnpm@9.12.3",
+  "scripts": {
+    "build": "turbo run build",
+    "dev": "turbo run dev",
+    "lint": "turbo run lint",
+    "typecheck": "turbo run typecheck",
+    "test": "turbo run test",
+    "format": "prettier --write \"**/*.{ts,tsx,js,jsx,json,md,yaml,yml}\"",
+    "format:check": "prettier --check \"**/*.{ts,tsx,js,jsx,json,md,yaml,yml}\"",
+    "db:generate": "pnpm --filter @wgc/db generate",
+    "db:migrate": "pnpm --filter @wgc/db migrate",
+    "db:seed": "pnpm --filter @wgc/db seed",
+    "db:studio": "pnpm --filter @wgc/db studio",
+    "dev:bootstrap-auth": "tsx --env-file=.env infra/scripts/bootstrap-auth.ts",
+    "supabase:start": "supabase start -x studio,realtime,logflare,vector,imgproxy,edge-runtime",
+    "supabase:start:full": "supabase start",
+    "supabase:stop": "supabase stop",
+    "supabase:status": "supabase status"
+  },
+  "devDependencies": {
+    "@supabase/supabase-js": "^2.46.1",
+    "@types/node": "^20.17.6",
+    "@types/ws": "^8.18.1",
+    "prettier": "^3.3.3",
+    "tsx": "^4.19.2",
+    "turbo": "^2.2.3",
+    "typescript": "^5.6.3",
+    "ws": "^8.20.0"
+  }
+}

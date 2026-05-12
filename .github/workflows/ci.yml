@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  NODE_VERSION: '20.18.0'
+  PNPM_VERSION: '9.12.3'
+
+jobs:
+  lint-typecheck-test:
+    name: Lint, typecheck, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm format:check
+      - run: pnpm lint
+      - run: pnpm typecheck
+      - run: pnpm test
+
+  migration-check:
+    name: Migration check (apply 0001 to ephemeral Postgres)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: wgc_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/wgc_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Apply migrations
+        run: pnpm --filter @wgc/db migrate
+      - name: Verify all expected tables exist
+        run: |
+          PGPASSWORD=postgres psql -h localhost -U postgres -d wgc_test -tAc \
+            "SELECT count(*) FROM information_schema.tables WHERE table_schema='public' AND table_name IN ('counsellors','students','tasks','completions','artifacts','conversations','sessions','assessments','submissions','reports','plans','change_requests','review_queue','student_profile_drafts','sync_outbox','calendar_watch_channels','events','ai_calls','transcriptions','idempotency_records','errors')" \
+            | tee /tmp/count.txt
+          test "$(cat /tmp/count.txt)" = "21"

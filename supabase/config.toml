@@ -1,0 +1,82 @@
+# Local Supabase configuration. Run `pnpm supabase:start` to spin up.
+# https://supabase.com/docs/guides/cli/local-development#configuration
+
+project_id = "wgc-platform"
+
+[api]
+enabled = true
+port = 54321
+schemas = ["public", "storage", "graphql_public"]
+extra_search_path = ["public", "extensions"]
+max_rows = 1000
+
+[db]
+port = 54322
+shadow_port = 54320
+major_version = 15
+
+[studio]
+enabled = false   # Use `pnpm db:studio` (Drizzle Studio) instead. Re-enable with `pnpm supabase:start:full`.
+port = 54323
+
+[inbucket]
+enabled = true
+port = 54324
+# In dev, magic-link emails go to Inbucket at http://localhost:54324
+
+[storage]
+enabled = true
+file_size_limit = "50MiB"
+
+[storage.buckets.artifacts]
+public = false
+file_size_limit = "50MiB"
+allowed_mime_types = [
+  "image/jpeg",
+  "image/png",
+  "image/heic",
+  "image/webp",
+  "application/pdf",
+  "audio/mpeg",
+  "audio/mp4",
+  "audio/m4a",
+  "audio/webm",
+  "audio/ogg",
+]
+
+[auth]
+enabled = true
+# site_url = the canonical web app (apps/web on :3000). When OAuth redirect
+# is missing/disallowed Supabase falls back here.
+site_url = "http://localhost:3000"
+additional_redirect_urls = [
+    "http://localhost:3000",
+    "http://localhost:3000/auth/callback",
+]
+jwt_expiry = 3600
+# Phase 6 follow-on: magic-link / email OTP is OFF. Sign-in happens via
+# Google OAuth only. The API auth middleware auto-creates a pending student
+# row on first sign-in if no counsellor/student match exists.
+enable_signup = true
+
+[auth.email]
+# Disabled — Google OAuth only.
+enable_signup = false
+enable_confirmations = false
+
+# Google OAuth provider. Credentials come from env (see .env.example).
+# Reuse your Google Calendar OAuth client OR create a separate Web OAuth
+# client in Google Cloud Console. Add this redirect URI to it:
+#   http://127.0.0.1:54321/auth/v1/callback
+[auth.external.google]
+enabled = true
+client_id = "env(WGC_GOOGLE_AUTH_CLIENT_ID)"
+secret = "env(WGC_GOOGLE_AUTH_CLIENT_SECRET)"
+# Supabase CLI requires this even though it duplicates the well-known
+# value below. Without it gotrue throws "missing redirect URI" on
+# signInWithOAuth even when the provider is enabled.
+redirect_uri = "http://127.0.0.1:54321/auth/v1/callback"
+skip_nonce_check = false
+
+[edge_runtime]
+enabled = false
