@@ -29,27 +29,40 @@ export default function ProfileDraftReviewPage() {
     mutationFn: (p: Record<string, unknown>) => onboardingApi.edit(id, p),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['profile-draft', id] }),
   });
+  // Approve / reject / regenerate all alter what shows on the /students
+  // pending-banner and the /onboarding list, so invalidate those too.
+  const invalidateAll = async () => {
+    await Promise.all([
+      qc.invalidateQueries({ queryKey: ['profile-draft', id] }),
+      qc.invalidateQueries({ queryKey: ['profile-drafts'] }),
+      qc.invalidateQueries({ queryKey: ['students-overview'] }),
+      qc.invalidateQueries({ queryKey: ['queue'] }),
+    ]);
+  };
   const approve = useMutation({
     mutationFn: () => onboardingApi.approve(id),
     onSuccess: async (res) => {
-      await qc.invalidateQueries({ queryKey: ['profile-draft', id] });
+      await invalidateAll();
       if (res.studentId) router.replace(`/students/${res.studentId}/profile`);
     },
   });
   const regenerate = useMutation({
     mutationFn: () => onboardingApi.regenerate(id, regenNotes),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['profile-draft', id] }),
+    onSuccess: invalidateAll,
   });
   const reject = useMutation({
     mutationFn: () => onboardingApi.reject(id),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['profile-draft', id] }),
+    onSuccess: invalidateAll,
   });
   const ignore = useMutation({
     mutationFn: () =>
       draft?.studentId
         ? onboardingApi.ignoreStudent(draft.studentId)
         : Promise.reject(new Error('no student id')),
-    onSuccess: () => router.replace('/onboarding'),
+    onSuccess: async () => {
+      await invalidateAll();
+      router.replace('/onboarding');
+    },
   });
 
   if (isLoading || !draft) return <p className="text-sm text-muted-foreground">Loading…</p>;

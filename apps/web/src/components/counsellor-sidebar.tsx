@@ -3,7 +3,16 @@
 import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
 import { useQuery } from '@tanstack/react-query';
-import { CheckSquare, Inbox, LayoutGrid, LogOut, Settings, UserPlus, Users } from 'lucide-react';
+import {
+  CheckSquare,
+  Inbox,
+  LayoutGrid,
+  LogOut,
+  Settings,
+  UserPlus,
+  Users,
+  X,
+} from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { counsellorApi } from '@/lib/api';
 import { getBrowserSupabase } from '@/lib/supabase';
@@ -16,9 +25,22 @@ const NAV: Array<{ href: string; label: string; icon: React.ComponentType<{ clas
   { href: '/settings', label: 'Settings', icon: Settings },
 ];
 
+// Capture `/students/<id>/...` — when the counsellor is "in" a student.
+// `<id>` matches the first path segment after /students/, which is the
+// student id for every route under that layout (today/queue/todos/etc).
+function activeStudentIdFromPath(pathname: string): string | null {
+  const m = pathname.match(/^\/students\/([^/]+)(?:\/|$)/);
+  if (!m) return null;
+  const id = m[1]!;
+  // The /students grid itself has no id segment; guard against accidental
+  // matches like `/students` (no trailing) — handled by the `/` requirement.
+  return id;
+}
+
 export function CounsellorSidebar() {
   const pathname = usePathname();
   const router = useRouter();
+  const activeStudentId = activeStudentIdFromPath(pathname);
 
   const { data: queue } = useQuery({
     queryKey: ['queue', 'pending'],
@@ -26,6 +48,13 @@ export function CounsellorSidebar() {
     refetchInterval: 60_000,
   });
   const pendingCount = queue?.data.length ?? 0;
+
+  const { data: activeStudent } = useQuery({
+    queryKey: ['student', activeStudentId],
+    queryFn: () =>
+      counsellorApi.student(activeStudentId!) as Promise<{ fullName: string; currentGrade: string }>,
+    enabled: Boolean(activeStudentId),
+  });
 
   async function logout() {
     await getBrowserSupabase().auth.signOut();
@@ -40,9 +69,32 @@ export function CounsellorSidebar() {
         </Link>
         <p className="mt-1 text-xs text-muted-foreground">Operating console</p>
       </div>
+
+      {activeStudentId && (
+        <div className="mb-4 rounded-md border border-border bg-background p-3">
+          <p className="text-[10px] uppercase tracking-wide text-muted-foreground">Viewing</p>
+          <p className="mt-0.5 truncate text-sm font-medium">
+            {activeStudent?.fullName ?? 'Loading…'}
+          </p>
+          {activeStudent && (
+            <p className="text-xs text-muted-foreground">{activeStudent.currentGrade}</p>
+          )}
+          <Link
+            href="/students"
+            className="mt-2 inline-flex items-center gap-1 text-[11px] text-muted-foreground hover:underline"
+          >
+            <X className="h-3 w-3" /> All students
+          </Link>
+        </div>
+      )}
+
       <ul className="space-y-1">
         {NAV.map((item) => {
-          const active = pathname.startsWith(item.href);
+          // When in student-mode, /queue and /todos should not look "active"
+          // — the counsellor is inside the per-student version of those tabs.
+          const active = activeStudentId
+            ? item.href === '/students' && pathname.startsWith('/students')
+            : pathname.startsWith(item.href);
           return (
             <li key={item.href}>
               <Link

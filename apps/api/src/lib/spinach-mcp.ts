@@ -45,6 +45,20 @@ export class SpinachReauthRequired extends Error {
   }
 }
 
+/**
+ * Thrown when Spinach replies with a rate-limit error payload
+ * (`{error, message, limit_per_second, limit_per_hour}`). The poll loop
+ * catches this and stops cleanly so the cron retries on the next tick.
+ */
+export class SpinachRateLimited extends Error {
+  constructor(public readonly limits: { perSecond?: number; perHour?: number }, message: string) {
+    super(message);
+    this.name = 'SpinachRateLimited';
+  }
+}
+
+const SPINACH_DEBUG = process.env['WGC_SPINACH_DEBUG'] === '1';
+
 type StoredEnvelope =
   | { pending: { state: string; codeVerifier: string } }
   | { tokens: OAuthTokens; clientInfo?: OAuthClientInformationFull }
@@ -293,44 +307,42 @@ export type SpinachMeetingFull = SpinachMeetingSummary & {
   raw: Record<string, unknown>;
 };
 
+export type ListMeetingsPage = {
+  meetings: SpinachMeetingSummary[];
+  nextCursor: string | null;
+};
+
 /**
- * Connect, list meetings updated since `since`, then close. Tool names and
- * argument shape are based on Spinach's published MCP capabilities; we adapt
- * if their schema differs by inspecting `listTools()` at connect time.
+ * Fetch one page of meetings. Pass `cursor` from the previous page to walk
+ * deeper into history. Spinach's `list_meetings` ignores our `since` arg
+ * in practice — pagination is the only way to get more than the latest 50.
  */
-export async function listMeetings(
+export async function listMeetingsPage(
   counsellorId: string,
-  opts: { since?: Date | null } = {},
-): Promise<SpinachMeetingSummary[]> {
+  opts: { since?: Date | null; cursor?: string | null } = {},
+): Promise<ListMeetingsPage> {
   const { client, close } = await openClient(counsellorId);
   try {
     const tools = await client.listTools();
     const toolNames = tools.tools.map((t) => t.name);
-    logger.info({ counsellorId, toolNames }, 'spinach: listTools result');
+    if (SPINACH_DEBUG) logger.info({ counsellorId, toolNames }, 'spinach: listTools result');
     const toolNameSet = new Set(toolNames);
     const args: Record<string, unknown> = {};
     if (opts.since) args['since'] = opts.since.toISOString();
+    if (opts.cursor) args['cursor'] = opts.cursor;
     const toolName = pickTool(toolNameSet, ['list_meetings', 'meetings_list', 'search_meetings']);
     if (!toolName) {
       logger.warn({ counsellorId, toolNames }, 'spinach: no list_meetings-like tool');
-      return [];
+      return { meetings: [], nextCursor: null };
     }
-    logger.info(
-      { counsellorId, toolName, args },
-      'spinach: calling list-meetings-like tool',
-    );
     const res = await client.callTool({ name: toolName, arguments: args });
-    debugLogToolResult('list_meetings', counsellorId, res);
+    if (SPINACH_DEBUG) debugLogToolResult('list_meetings', counsellorId, res);
+
+    const parsedJson = extractJsonFromToolResult(res);
+    throwIfRateLimited(parsedJson, 'list_meetings');
     const meetings = parseMeetingList(res);
-    logger.info(
-      {
-        counsellorId,
-        count: meetings.length,
-        firstIds: meetings.slice(0, 5).map((m) => m.id),
-      },
-      'spinach: parsed meetings list',
-    );
-    return meetings;
+    const nextCursor = extractCursor(parsedJson);
+    return { meetings, nextCursor };
   } finally {
     await close();
   }
@@ -361,8 +373,7 @@ export async function pullFullMeeting(
     }
     const toolDef = tools.tools.find((t) => t.name === toolName);
     // Spinach's `get` accepts an `include` array; without it the call returns
-    // an empty stub (we observed `{error, message, limit_per_*}`). Request
-    // every field we use in ingestOneMeeting.
+    // an empty stub. Request every field we consume in ingestOneMeeting.
     const callArgs: Record<string, unknown> =
       toolName === 'get'
         ? {
@@ -378,32 +389,25 @@ export async function pullFullMeeting(
             ],
           }
         : { meeting_id: meetingId };
-    logger.info(
-      {
-        counsellorId,
-        toolName,
-        meetingId,
-        callArgs,
-        inputSchema: toolDef?.inputSchema,
-      },
-      'spinach: calling pull-meeting tool',
-    );
+    if (SPINACH_DEBUG) {
+      logger.info(
+        { counsellorId, toolName, meetingId, callArgs, inputSchema: toolDef?.inputSchema },
+        'spinach: calling pull-meeting tool',
+      );
+    }
     const res = await client.callTool({ name: toolName, arguments: callArgs });
-    debugLogToolResult(`pull_meeting:${meetingId}`, counsellorId, res);
+    if (SPINACH_DEBUG) debugLogToolResult(`pull_meeting:${meetingId}`, counsellorId, res);
+    throwIfRateLimited(extractJsonFromToolResult(res), `pull_meeting:${meetingId}`);
     const parsed = parseMeetingFull(res, meetingId);
-    if (parsed) {
+    if (parsed && SPINACH_DEBUG) {
       logger.info(
         {
           counsellorId,
           meetingId,
           title: parsed.title,
-          scheduledAt: parsed.scheduledAt,
           attendeeCount: parsed.attendees.length,
-          attendeeEmails: parsed.attendees.map((a) => a.email).filter(Boolean),
           summaryLen: parsed.summary?.length ?? 0,
           transcriptLen: parsed.transcript?.length ?? 0,
-          actionItemCount: parsed.actionItems?.length ?? 0,
-          rawKeys: Object.keys(parsed.raw),
         },
         'spinach: pull meeting parsed',
       );
@@ -412,6 +416,37 @@ export async function pullFullMeeting(
   } finally {
     await close();
   }
+}
+
+/**
+ * Detect Spinach's rate-limit response shape and convert it to a typed
+ * error so callers can stop the poll cleanly. The shape we've observed:
+ *   { error: <code>, message: <human>, limit_per_second: N, limit_per_hour: N }
+ */
+function throwIfRateLimited(parsed: unknown, context: string): void {
+  if (!parsed || typeof parsed !== 'object') return;
+  const p = parsed as Record<string, unknown>;
+  if (!('error' in p)) return;
+  const hasLimits = 'limit_per_second' in p || 'limit_per_hour' in p;
+  if (!hasLimits) return;
+  const msg = typeof p['message'] === 'string' ? p['message'] : 'Spinach rate limited';
+  const perSecond = typeof p['limit_per_second'] === 'number' ? (p['limit_per_second'] as number) : undefined;
+  const perHour = typeof p['limit_per_hour'] === 'number' ? (p['limit_per_hour'] as number) : undefined;
+  const limits: { perSecond?: number; perHour?: number } = {};
+  if (perSecond !== undefined) limits.perSecond = perSecond;
+  if (perHour !== undefined) limits.perHour = perHour;
+  throw new SpinachRateLimited(limits, `${context}: ${msg}`);
+}
+
+function extractCursor(parsed: unknown): string | null {
+  if (!parsed || typeof parsed !== 'object') return null;
+  const p = parsed as Record<string, unknown>;
+  const candidates = ['next_cursor', 'nextCursor', 'cursor'];
+  for (const k of candidates) {
+    const v = p[k];
+    if (typeof v === 'string' && v.length > 0) return v;
+  }
+  return null;
 }
 
 // ─── Tool result parsing (lenient: Spinach's exact shape is undocumented) ──

@@ -129,9 +129,25 @@ studentScopedRoutes.post('/tasks/:id/completions', idempotency, async (c) => {
 
 // ─── Artifacts ───────────────────────────────────────────────────────────────
 
+// Allowed MIME types for student-uploaded artifacts. Mirrors the storage
+// bucket's allowed_mime_types in supabase/config.toml, but enforced earlier
+// (the storage-side check happens after the signed URL is issued, which is
+// too late to give the student a clean error).
+const ALLOWED_MIME_PREFIXES = ['image/', 'audio/', 'video/'];
+const ALLOWED_MIME_EXACT = new Set(['application/pdf']);
+
+function isAllowedMime(t: string): boolean {
+  const lower = t.toLowerCase();
+  if (ALLOWED_MIME_EXACT.has(lower)) return true;
+  return ALLOWED_MIME_PREFIXES.some((p) => lower.startsWith(p));
+}
+
 const SignSchema = z.object({
   filename: z.string().min(1),
-  contentType: z.string().min(1),
+  contentType: z
+    .string()
+    .min(1)
+    .refine(isAllowedMime, { message: 'Unsupported file type' }),
   sizeBytes: z.number().int().positive().max(MAX_BYTES),
 });
 
@@ -157,7 +173,10 @@ studentScopedRoutes.post('/artifacts/upload-url', idempotency, async (c) => {
 const ConfirmSchema = z.object({
   taskId: z.string().uuid().optional(),
   fileUrl: z.string().min(1),
-  fileType: z.string().min(1),
+  fileType: z
+    .string()
+    .min(1)
+    .refine(isAllowedMime, { message: 'Unsupported file type' }),
   fileSizeBytes: z.number().int().positive().max(MAX_BYTES),
   originalFilename: z.string().optional(),
 });

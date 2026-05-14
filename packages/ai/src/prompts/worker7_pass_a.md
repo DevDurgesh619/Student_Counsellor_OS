@@ -30,6 +30,12 @@ If a section is empty, omit it. Do not pad.
 Student: {{student_name}}
 This session ended on: {{session_date}}
 
+Approved onboarding profile (immutable baseline — who this student is):
+{{onboarding_profile}}
+
+Rolling longitudinal summary (the story so far, built from prior meetings):
+{{rolling_history}}
+
 Structured extraction from this session:
 {{extraction_json}}
 

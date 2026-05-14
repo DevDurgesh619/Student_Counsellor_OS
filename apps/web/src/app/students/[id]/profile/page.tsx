@@ -1,5 +1,6 @@
 'use client';
 
+import { useState } from 'react';
 import { useParams } from 'next/navigation';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { calendarApi, counsellorApi } from '@/lib/api';
@@ -64,6 +65,8 @@ export default function StudentProfilePage() {
       </dl>
 
       <CalendarSection studentId={params.id} />
+
+      {data.status === 'active' && <SpinachBackfillSection studentId={params.id} />}
 
       <section>
         <h3 className="text-sm font-medium uppercase tracking-wide text-muted-foreground">
@@ -180,5 +183,93 @@ function Row({ label, value }: { label: string; value: string }) {
       <dt className="text-xs uppercase tracking-wide text-muted-foreground">{label}</dt>
       <dd className="mt-1">{value}</dd>
     </div>
+  );
+}
+
+function SpinachBackfillSection({ studentId }: { studentId: string }) {
+  const qc = useQueryClient();
+  const [lookbackDays, setLookbackDays] = useState(365);
+  const [lastResult, setLastResult] = useState<{
+    scanned: number;
+    imported: number;
+    skipped: number;
+    failed: number;
+    durationMs: number;
+    rateLimited: boolean;
+  } | null>(null);
+
+  const backfill = useMutation({
+    mutationFn: () =>
+      counsellorApi.backfillStudentSpinach(studentId, { lookbackDays }),
+    onSuccess: (res) => {
+      setLastResult(res);
+      qc.invalidateQueries({ queryKey: ['student', studentId] });
+      qc.invalidateQueries({ queryKey: ['queue'] });
+    },
+  });
+
+  function onClick() {
+    const ok = window.confirm(
+      `Import every Spinach meeting from the last ${lookbackDays} days that matches this student?\n\n` +
+        `Each meeting consumes LLM tokens (extraction + brief + rolling-summary regen).`,
+    );
+    if (ok) backfill.mutate();
+  }
+
+  return (
+    <section className="space-y-3 rounded-lg border border-border bg-card p-4">
+      <div className="flex items-center justify-between">
+        <h3 className="text-sm font-medium uppercase tracking-wide text-muted-foreground">
+          Import history from Spinach
+        </h3>
+      </div>
+      <p className="text-xs text-muted-foreground">
+        Walks your Spinach history, auto-matches meetings to this student, and ingests them
+        chronologically so the rolling summary builds the full story before today's meetings.
+        Skips anything already imported. Runs synchronously — leave the tab open until it
+        returns.
+      </p>
+      <div className="flex flex-wrap items-end gap-3">
+        <label className="space-y-1 text-xs">
+          <span className="block text-muted-foreground">Lookback (days)</span>
+          <input
+            type="number"
+            min={1}
+            max={730}
+            value={lookbackDays}
+            onChange={(e) => setLookbackDays(Math.max(1, Math.min(730, Number(e.target.value) || 365)))}
+            className="w-24 rounded-md border border-input bg-background px-2 py-1 text-sm"
+          />
+        </label>
+        <button
+          onClick={onClick}
+          disabled={backfill.isPending}
+          className="rounded-md border border-input px-3 py-1.5 text-xs hover:bg-muted disabled:opacity-60"
+        >
+          {backfill.isPending ? 'Importing… (this can take 1-2 min)' : 'Import history'}
+        </button>
+      </div>
+      {backfill.error && (
+        <p className="text-xs text-destructive">{(backfill.error as Error).message}</p>
+      )}
+      {lastResult && (
+        <div className="rounded-md border border-border bg-muted/30 p-3 text-xs">
+          <p>
+            Scanned <strong>{lastResult.scanned}</strong> Spinach meetings, imported{' '}
+            <strong>{lastResult.imported}</strong>, skipped{' '}
+            <strong>{lastResult.skipped}</strong> (already present), failed{' '}
+            <strong>{lastResult.failed}</strong>.
+          </p>
+          {lastResult.rateLimited && (
+            <p className="mt-1 text-warning">
+              Spinach rate-limited mid-run; re-run later to pick up the rest.
+            </p>
+          )}
+          <p className="mt-1 text-muted-foreground">
+            Took {(lastResult.durationMs / 1000).toFixed(1)}s.
+          </p>
+        </div>
+      )}
+    </section>
   );
 }

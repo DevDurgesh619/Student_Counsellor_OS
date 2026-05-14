@@ -18,6 +18,7 @@ export * from './student-profile-drafts.js';
 export * from './assistant.js';
 export * from './session-pipeline.js';
 export * from './spinach-inbox.js';
+export * from './student-history.js';
 
 // Operational tables (CLAUDE_CODE.md §8)
 export * from './sync-outbox.js';

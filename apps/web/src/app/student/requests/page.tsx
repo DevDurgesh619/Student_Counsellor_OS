@@ -1,7 +1,8 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { format } from 'date-fns';
 import { studentApi } from '@/lib/api';
 
 export default function RequestsPage() {
@@ -15,6 +16,7 @@ export default function RequestsPage() {
   const [proposedChange, setProposedChange] = useState('');
   const [reason, setReason] = useState('');
   const [pattern, setPattern] = useState('');
+  const [justSent, setJustSent] = useState(false);
   const m = useMutation({
     mutationFn: () =>
       studentApi.submitChangeRequest({
@@ -26,9 +28,15 @@ export default function RequestsPage() {
       setProposedChange('');
       setReason('');
       setPattern('');
+      setJustSent(true);
       await qc.invalidateQueries({ queryKey: ['my-change-requests'] });
     },
   });
+  useEffect(() => {
+    if (!justSent) return;
+    const t = setTimeout(() => setJustSent(false), 3000);
+    return () => clearTimeout(t);
+  }, [justSent]);
 
   return (
     <div className="space-y-6">
@@ -68,6 +76,7 @@ export default function RequestsPage() {
           {m.isPending ? 'Sending…' : 'Send request'}
         </button>
         {m.error && <p className="text-xs text-destructive">{(m.error as Error).message}</p>}
+        {justSent && <p className="text-xs text-success">Sent — your counsellor will see this.</p>}
       </section>
 
       <section className="space-y-2">
@@ -87,8 +96,8 @@ export default function RequestsPage() {
                 <StatusBadge status={r.status} />
               </div>
               <div className="mt-2 text-[11px] text-muted-foreground">
-                {new Date(r.requestedAt).toLocaleString()}
-                {r.decidedAt && ` · decided ${new Date(r.decidedAt).toLocaleDateString()}`}
+                {format(new Date(r.requestedAt), 'MMM d, h:mm a')}
+                {r.decidedAt && ` · decided ${format(new Date(r.decidedAt), 'MMM d')}`}
               </div>
               {r.counsellorNotes && (
                 <p className="mt-2 rounded-md bg-muted p-2 text-xs">{r.counsellorNotes}</p>

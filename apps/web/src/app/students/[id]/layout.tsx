@@ -10,10 +10,13 @@ import { cn } from '@/lib/utils';
 const TABS = [
   { slug: 'today', label: 'Today' },
   { slug: 'week', label: 'Week' },
+  { slug: 'queue', label: 'Queue' },
+  { slug: 'todos', label: 'Todos' },
   { slug: 'artifacts', label: 'Artifacts' },
   { slug: 'requests', label: 'Requests' },
   { slug: 'sessions', label: 'Sessions' },
   { slug: 'brief', label: 'Brief' },
+  { slug: 'history', label: 'History' },
   { slug: 'gaps', label: 'Gaps' },
   { slug: 'profile', label: 'Profile' },
   { slug: 'ask-ai', label: 'Ask AI' },

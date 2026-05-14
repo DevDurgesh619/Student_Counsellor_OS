@@ -102,12 +102,35 @@ export const counsellorApi = {
     api<{ data: unknown[] }>(`/api/students/${id}/artifacts`),
   studentSessions: (id: string) =>
     api<{ data: unknown[] }>(`/api/counsellor/students/${id}/sessions`),
+  studentHistorySummary: (id: string) =>
+    api<{
+      current: {
+        id: string;
+        studentId: string;
+        currentVersion: number;
+        content: string;
+        openConcerns: unknown[];
+        lastUpdatedFocus: string | null;
+        basedOnSessionIds: string[];
+        generatedAt: string;
+        aiCallId: string | null;
+      } | null;
+      versions: Array<{
+        id: string;
+        version: number;
+        content: string;
+        openConcerns: unknown[];
+        lastUpdatedFocus: string | null;
+        basedOnSessionIds: string[];
+        generatedAt: string;
+      }>;
+    }>(`/api/counsellor/students/${id}/history-summary`),
   studentChangeRequests: (id: string, status?: string) =>
     api<{ data: unknown[] }>(`/api/counsellor/students/${id}/change-requests`, {
       query: { status },
     }),
-  queue: (status?: string) =>
-    api<{ data: unknown[] }>('/api/counsellor/queue', { query: { status } }),
+  queue: (status?: string, studentId?: string) =>
+    api<{ data: unknown[] }>('/api/counsellor/queue', { query: { status, studentId } }),
   resolveQueueItem: (id: string, body: { status?: 'resolved' | 'dismissed'; resolutionNotes?: string }) =>
     api<unknown>(`/api/counsellor/queue/${id}/resolve`, { method: 'PATCH', body }),
   decideChangeRequest: (id: string, body: { decision: 'approved' | 'rejected'; counsellorNotes?: string }) =>
@@ -118,6 +141,22 @@ export const counsellorApi = {
     }),
   createSession: (studentId: string, body: unknown) =>
     api<unknown>(`/api/counsellor/students/${studentId}/sessions`, {
+      method: 'POST',
+      body,
+      idempotencyKey: crypto.randomUUID(),
+    }),
+  backfillStudentSpinach: (
+    studentId: string,
+    body: { lookbackDays?: number } = {},
+  ) =>
+    api<{
+      scanned: number;
+      imported: number;
+      skipped: number;
+      failed: number;
+      durationMs: number;
+      rateLimited: boolean;
+    }>(`/api/counsellor/students/${studentId}/spinach-backfill`, {
       method: 'POST',
       body,
       idempotencyKey: crypto.randomUUID(),
@@ -207,7 +246,8 @@ export const counsellorApi = {
       targetResolutionDate: string | null;
     }>,
   ) => api<unknown>(`/api/counsellor/gaps/${gapId}`, { method: 'PATCH', body }),
-  todos: () => api<{ data: CounsellorTodoRow[] }>('/api/counsellor/todos'),
+  todos: (studentId?: string) =>
+    api<{ data: CounsellorTodoRow[] }>('/api/counsellor/todos', { query: { studentId } }),
   patchTodo: (id: string, body: { status: 'pending' | 'completed' | 'cancelled' }) =>
     api<unknown>(`/api/counsellor/todos/${id}`, { method: 'PATCH', body }),
 

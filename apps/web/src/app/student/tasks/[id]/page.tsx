@@ -5,6 +5,7 @@ import { useParams, useRouter } from 'next/navigation';
 import { useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { ChevronLeft } from 'lucide-react';
+import { format } from 'date-fns';
 import { studentApi } from '@/lib/api';
 import { ArtifactUploader } from '@/components/artifact-uploader';
 
@@ -59,8 +60,7 @@ export default function TaskDetailPage() {
         <div className="text-xs uppercase tracking-wide text-muted-foreground">{task.subject}</div>
         <h1 className="text-2xl font-semibold">{task.taskTitle}</h1>
         <p className="text-sm text-muted-foreground">
-          {start.toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })} –{' '}
-          {end.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}
+          {format(start, 'MMM d, h:mm a')} – {format(end, 'h:mm a')}
         </p>
       </header>
 
@@ -136,7 +136,7 @@ export default function TaskDetailPage() {
               <li key={a.id} className="rounded-md border border-border bg-card px-3 py-2 text-xs">
                 <div className="font-mono">{a.originalFilename ?? a.fileType}</div>
                 <div className="text-muted-foreground">
-                  {new Date(a.uploadedAt).toLocaleString()}
+                  {format(new Date(a.uploadedAt), 'MMM d, h:mm a')}
                 </div>
               </li>
             ))}
@@ -155,7 +155,7 @@ export default function TaskDetailPage() {
                 <div className="flex justify-between">
                   <span className="font-medium capitalize">{c.statusClaimed.replace('_', ' ')}</span>
                   <span className="text-muted-foreground">
-                    {new Date(c.submittedAt).toLocaleString()}
+                    {format(new Date(c.submittedAt), 'MMM d, h:mm a')}
                   </span>
                 </div>
                 {c.notesText && <p className="mt-1 text-muted-foreground">{c.notesText}</p>}

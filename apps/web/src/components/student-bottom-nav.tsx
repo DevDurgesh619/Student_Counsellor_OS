@@ -2,8 +2,10 @@
 
 import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
+import { useQuery } from '@tanstack/react-query';
 import { Calendar, FileText, Home, Inbox, Settings as SettingsIcon, LogOut } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { meApi } from '@/lib/api';
 import { getBrowserSupabase } from '@/lib/supabase';
 
 const ITEMS = [
@@ -17,9 +19,17 @@ const ITEMS = [
 export function StudentBottomNav() {
   const pathname = usePathname();
   const router = useRouter();
+  const { data: me } = useQuery({ queryKey: ['me'], queryFn: meApi.me });
+  const fullName =
+    typeof me?.profile?.fullName === 'string' ? (me.profile.fullName as string) : null;
+  const firstName = fullName?.split(' ')[0] ?? null;
 
   async function logout() {
-    await getBrowserSupabase().auth.signOut();
+    try {
+      await getBrowserSupabase().auth.signOut();
+    } catch {
+      // best-effort
+    }
     router.replace('/login');
   }
 
@@ -48,9 +58,10 @@ export function StudentBottomNav() {
       {/* Tablet/desktop: side rail */}
       <aside className="hidden md:flex md:order-first md:w-56 md:shrink-0 md:flex-col md:border-r md:border-border md:bg-muted/30 md:p-4">
         <div className="mb-6">
-          <Link href="/student/today" className="font-semibold">
-            WGC Student
+          <Link href="/student/today" className="block font-semibold">
+            {firstName ?? 'Student'}
           </Link>
+          <p className="mt-0.5 text-xs text-muted-foreground">WGC student app</p>
         </div>
         <ul className="space-y-1">
           {ITEMS.map((item) => {

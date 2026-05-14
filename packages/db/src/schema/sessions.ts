@@ -24,6 +24,7 @@ export const sessions = pgTable(
     structuredExtractionId: uuid('structured_extraction_id'), // Phase 6 — references session_extractions
     agendaUsedId: uuid('agenda_used_id'), // Phase 6 — references meeting_prep_briefs
     status: text('status').notNull().default('scheduled'),
+    matchedVia: text('matched_via'),
     createdAt: createdAt(),
   },
   (t) => ({

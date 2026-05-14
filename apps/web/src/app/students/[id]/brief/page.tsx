@@ -79,6 +79,24 @@ export default function BriefPage() {
         </p>
       </header>
 
+      {touched && remoteText && remoteText !== draft && (
+        <div className="flex items-start justify-between gap-3 rounded-md border border-warning/40 bg-warning/10 p-3 text-xs">
+          <span>
+            The server has a newer version of this brief (Pass B may have just
+            regenerated). Your local edits aren't lost — but if you want to see
+            the new content, save or discard yours first.
+          </span>
+          <button
+            onClick={() => {
+              setDraft(remoteText);
+              setTouched(false);
+            }}
+            className="shrink-0 rounded-md border border-border bg-background px-2 py-1 hover:bg-muted"
+          >
+            Discard mine
+          </button>
+        </div>
+      )}
       <textarea
         value={draft}
         onChange={(e) => {

@@ -3,8 +3,8 @@
 import Link from 'next/link';
 import { useMemo, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { Search } from 'lucide-react';
-import { counsellorApi, type StudentOverview } from '@/lib/api';
+import { Search, UserPlus } from 'lucide-react';
+import { counsellorApi, onboardingApi, type StudentOverview } from '@/lib/api';
 import { cn, formatRelative } from '@/lib/utils';
 
 type SortKey = 'recent' | 'name' | 'pending';
@@ -17,7 +17,18 @@ export default function StudentsOverviewPage() {
     queryKey: ['students-overview'],
     queryFn: counsellorApi.studentsOverview,
     staleTime: 30_000,
+    refetchInterval: 30_000,
   });
+  // Surface pending onboarding drafts so they're discoverable from /students,
+  // not just the sidebar.
+  const { data: drafts } = useQuery({
+    queryKey: ['profile-drafts'],
+    queryFn: () => onboardingApi.drafts(),
+    staleTime: 60_000,
+  });
+  const pendingCount = (drafts?.data ?? []).filter(
+    (d) => d.status === 'pending_review' || d.status === 'awaiting_form',
+  ).length;
 
   const students: StudentOverview[] = data?.data ?? [];
 
@@ -66,6 +77,19 @@ export default function StudentsOverviewPage() {
           </select>
         </div>
       </header>
+
+      {pendingCount > 0 && (
+        <Link
+          href="/onboarding"
+          className="flex items-center justify-between rounded-lg border border-warning/40 bg-warning/10 p-3 text-sm hover:bg-warning/20"
+        >
+          <span className="flex items-center gap-2">
+            <UserPlus className="h-4 w-4" />
+            <strong>{pendingCount}</strong> student{pendingCount === 1 ? '' : 's'} waiting for your review
+          </span>
+          <span className="text-xs text-muted-foreground">Open onboarding →</span>
+        </Link>
+      )}
 
       {isLoading && <p className="text-sm text-muted-foreground">Loading…</p>}
       {error && (

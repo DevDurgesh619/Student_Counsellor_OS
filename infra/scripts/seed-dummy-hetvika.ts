@@ -1,97 +1,162 @@
 /**
- * Seed a fully-populated dummy student "Hetvika" with a submitted onboarding
- * draft, ready for a counsellor to approve via the /onboarding UI.
+ * Seed the REAL Hetvika Rupani with an approved-style onboarding draft, so
+ * the AI profile fed into every downstream LLM call (rolling summary, Pass
+ * A/B briefs, reports) matches what's actually discussed in her real
+ * Spinach meetings.
  *
  * After running:
  *   1. Sign in as a counsellor (e.g. wallickglobalconsulting@gmail.com)
- *   2. Open /onboarding — Hetvika appears in the queue
- *   3. Click into her draft → review → Approve
- *   4. Sign in (different browser / incognito) as patidardurgesh619@gmail.com
- *      → land on /student/today, acting as Hetvika
+ *   2. Open /onboarding — Hetvika appears in the queue at pending_review
+ *   3. Click into her draft → Approve & activate
+ *   4. Import history from Spinach via her /profile page
  *
- * Re-running is idempotent: if Hetvika's student row already exists, the
- * existing draft is updated rather than duplicated.
+ * Re-running is idempotent: existing student row + draft are updated rather
+ * than duplicated, and counsellorId is reset so approval re-runs cleanly.
  *
  * Usage:
  *   pnpm tsx --env-file=.env infra/scripts/seed-dummy-hetvika.ts
  */
-import { and, desc, eq } from 'drizzle-orm';
+import { desc, eq } from 'drizzle-orm';
 import { db, students, studentProfileDrafts } from '@wgc/db';
 
-const STUDENT_EMAIL = 'patidardurgesh619@gmail.com';
-const STUDENT_NAME = 'Hetvika Sharma';
+const STUDENT_EMAIL = 'hetvikarupani@gmail.com';
+const STUDENT_NAME = 'Hetvika Rupani';
 const STUDENT_GRADE = '11';
-const STUDENT_PHONE = '+91-9876501234';
-const SCHOOL = 'Delhi Public School, R.K. Puram';
+const STUDENT_PHONE = '+91-0000000000';
+const SCHOOL = 'CHIREC International School';
+const CITY = 'Hyderabad';
 
+/**
+ * Form responses — what Hetvika herself submitted (the raw onboarding form).
+ * Source: her real intake form (provided 2026-05-13). Counsellor-supplied
+ * fields she didn't fill in are left empty rather than fabricated.
+ */
 const formResponses = {
   basic_info: {
     full_name: STUDENT_NAME,
     grade: STUDENT_GRADE,
     school: SCHOOL,
-    date_of_birth: '2009-08-14',
+    city: CITY,
     phone: STUDENT_PHONE,
     email: STUDENT_EMAIL,
-    stream: 'Science (PCM + Computer Science)',
+    current_curriculum: 'IGCSE (Grade 11) — transitioning to IBDP for Grade 12',
+    class_12_board: 'IBDP',
   },
-  parent_info: [
-    {
-      name: 'Mr. Anil Sharma',
-      relationship: 'father',
-      phone: '+91-9810056789',
-      email: 'anil.sharma.dps@gmail.com',
-      occupation: 'Software Architect',
-    },
-    {
-      name: 'Mrs. Priya Sharma',
-      relationship: 'mother',
-      phone: '+91-9810067890',
-      email: 'priya.sharma.dps@gmail.com',
-      occupation: 'Math teacher, DAV School',
-    },
+  // No parent details captured in the intake form — leave empty so the AI
+  // doesn't hallucinate. Counsellor can fill in later.
+  parent_info: [],
+  subjects_grade_11: [
+    'Math AI HL',
+    'Chemistry HL',
+    'Biology HL',
+    'Economics SL',
+    'English SL',
+    'Spanish AB SL',
   ],
   academic_background:
-    'Consistently a top-quartile student. Strong in Math and Computer Science, weaker in Hindi (writing speed). Took CBSE board for Class 10 in 2025, scored 92.4%.',
+    'Grades / Percentage secured in the last three years: 75%. (No subject-wise breakdown provided at intake.)',
   manual_marks: [
-    { subject: 'English Communicative', marks_obtained: 88, marks_total: 100, year: '2025', term: 'CBSE Class 10 Board' },
-    { subject: 'Hindi Course-A', marks_obtained: 79, marks_total: 100, year: '2025', term: 'CBSE Class 10 Board' },
-    { subject: 'Mathematics (Standard)', marks_obtained: 98, marks_total: 100, year: '2025', term: 'CBSE Class 10 Board' },
-    { subject: 'Science', marks_obtained: 94, marks_total: 100, year: '2025', term: 'CBSE Class 10 Board' },
-    { subject: 'Social Science', marks_obtained: 91, marks_total: 100, year: '2025', term: 'CBSE Class 10 Board' },
-    { subject: 'Computer Applications', marks_obtained: 99, marks_total: 100, year: '2025', term: 'CBSE Class 10 Board' },
+    { period: 'Last three years average', percentage: 75 },
   ],
   goals: {
-    short_term: 'Score above 95% in Class 11 finals and clear KVPY/NTSE-equivalent screening.',
-    long_term: 'Get into a top CS undergrad — IIT Bombay CSE or IIIT Hyderabad. Eventually pursue an ML PhD.',
-    target_exams: ['JEE Main 2027', 'JEE Advanced 2027', 'BITSAT'],
+    target_major: 'Chemistry',
+    target_universities: ['Imperial College London', 'USC (University of Southern California)'],
+    target_countries: ['UK', 'USA'],
+    course_choice_reason:
+      'Chemistry — finds the subject fun and fascinating; out of all subjects she has been exposed to, she likes it the most.',
+    career_aspirations:
+      "Not yet decided — but certain it will be in the chemistry field.",
+    motivation_abroad:
+      'Wants to study in a global environment, for the exposure and the opportunities it brings.',
   },
+  extracurriculars: [
+    { activity: 'Drums', hours_per_week: 3, years: 4 },
+    { activity: 'Volleyball', hours_per_week: 2, years: 5 },
+  ],
+  certifications: ['Coursera (multiple)', 'Multiple volleyball competitions'],
+  projects: [
+    'Head of Marketing in a hackathon',
+    'Research paper (topic not specified at intake)',
+    'Internship at a hydroponics company',
+    'Crowd-funding initiative',
+  ],
+  about_self:
+    'Passion for gardening and environmental projects. Recently began a passion project on water quality in India.',
+  strengths:
+    'When she cares about something, she gives it her all to accomplish it — by being flexible and observing.',
+  weaknesses:
+    "Sometimes leaves things at mediocre when she doesn't care about them as much.",
+  books_outside_curriculum: [],
   self_reflection:
-    'I procrastinate physics numericals because they intimidate me, but I can grind through math for hours. Need a structured plan for physics. Also want to improve Hindi essay writing speed.',
+    'Self-described as flexible and observant when invested; admits to coasting on things she finds less interesting. Strong sense of direction toward Chemistry but career path within it is still open.',
   logistics: {
     timezone: 'Asia/Kolkata',
     language: 'en',
     devices: ['laptop', 'phone'],
-    schedule_constraints:
-      'School 8–2pm Mon-Fri, classical dance Tue/Thu 5–6:30pm, family time Sun evening.',
+    schedule_constraints: 'Not provided at intake.',
   },
   marksheet_paths: [],
 };
 
-// What Worker 1 (profile builder) would produce — required for the approve
-// endpoint, which refuses to flip the student to "active" until a profile
-// exists on the draft.
+/**
+ * AI profile — what Worker 1 (profile builder) would produce after reading
+ * the form. The approve endpoint refuses to flip the student to "active"
+ * without this. Fields stay grounded in what Hetvika actually said.
+ */
 const aiProfile = {
   name: STUDENT_NAME,
   current_grade: STUDENT_GRADE,
   school: SCHOOL,
+  city: CITY,
+  curriculum: 'IGCSE Grade 11 → IBDP Grade 12',
   language_preference: 'en',
-  subjects_strong: ['Mathematics', 'Computer Applications', 'Science'],
-  subjects_weak: ['Hindi (writing speed)', 'Physics numericals'],
-  exam_track: ['JEE Main 2027', 'JEE Advanced 2027'],
+
+  subjects_current: [
+    'Math AI HL',
+    'Chemistry HL',
+    'Biology HL',
+    'Economics SL',
+    'English SL',
+    'Spanish AB SL',
+  ],
+  subjects_strong: ['Chemistry'],
+  subjects_weak: [],
+
+  // No subject-wise mark breakdown — only overall 75% over last 3 years.
+  recent_academic_performance: '~75% overall across the last three years (no subject-wise data at intake).',
+
+  target_major: 'Chemistry',
+  target_universities: ['Imperial College London', 'USC'],
+  target_countries: ['UK', 'USA'],
+  exam_track: [],
+
+  career_field: 'Chemistry (specific path TBD)',
+
+  extracurriculars: [
+    'Drums — 3 hrs/week for 4 years',
+    'Volleyball — 2 hrs/week for 5 years',
+  ],
+  notable_projects: [
+    'Head of Marketing for a hackathon',
+    'Independent research paper',
+    'Internship at a hydroponics company',
+    'Crowd-funding initiative',
+    'Passion project: water-quality in India',
+  ],
+  certifications: ['Coursera (multiple)', 'Volleyball competition awards'],
+
   motivations:
-    'High self-driven academic ambition; clear long-term goal (CS undergrad → ML PhD). Family is supportive (mother is a teacher).',
-  risk_flags: ['Procrastinates physics numericals due to intimidation'],
-  preferred_study_block_minutes: 90,
+    'Driven by interest in chemistry and environmental/sustainability topics (gardening, hydroponics, water quality). Wants global academic exposure and opportunities abroad.',
+  strengths:
+    'Flexible and observant; high effort when personally invested in a project.',
+  growth_areas:
+    'Tends to coast on tasks she finds less engaging — may need external structure or framing to stay consistent on lower-interest subjects.',
+  risk_flags: [
+    'Selective engagement: quality drops sharply on tasks she finds uninteresting.',
+    'Career path within Chemistry is unclear — needs guided exploration.',
+  ],
+
+  preferred_study_block_minutes: 60,
 };
 
 async function main() {
@@ -108,9 +173,11 @@ async function main() {
         phone: STUDENT_PHONE,
         currentGrade: STUDENT_GRADE,
         school: SCHOOL,
+        // Reset back to pending_review and unclaim — approval re-runs cleanly.
         status: 'pending_review',
-        // Deliberately do NOT pin counsellorId — approval claims it.
         counsellorId: null,
+        // Also clear parent contacts so stale dummy parents don't linger.
+        parentContacts: [],
       })
       .where(eq(students.id, student.id));
     console.log(`Updated existing student ${STUDENT_EMAIL} → status=pending_review`);
@@ -148,10 +215,14 @@ async function main() {
         formResponses,
         profile: aiProfile,
         status: 'pending_review',
-        submittedAt: new Date(),
+        // Clear approval markers so the counsellor goes through the flow again.
+        acceptedAt: null,
+        acceptedBy: null,
+        counsellorId: null,
+        flagsForCounsellor: [],
       })
       .where(eq(studentProfileDrafts.id, latest.id));
-    console.log(`Updated existing draft ${latest.id} (formResponses + profile)`);
+    console.log(`Updated existing draft ${latest.id} (formResponses + profile reset)`);
   } else {
     const insertedDraft = await db
       .insert(studentProfileDrafts)
@@ -160,7 +231,6 @@ async function main() {
         formResponses,
         profile: aiProfile,
         status: 'pending_review',
-        submittedAt: new Date(),
       })
       .returning({ id: studentProfileDrafts.id });
     console.log(`Inserted draft ${insertedDraft[0]!.id}`);
@@ -168,9 +238,9 @@ async function main() {
 
   console.log('\nNext steps:');
   console.log('  1. Sign in as your counsellor (e.g. wallickglobalconsulting@gmail.com)');
-  console.log('  2. Open /onboarding → Hetvika appears in the queue');
-  console.log('  3. Click into her draft → review → Approve');
-  console.log(`  4. Sign in (incognito) as ${STUDENT_EMAIL} → land on /student/today`);
+  console.log('  2. Open /onboarding → Hetvika Rupani appears in the queue');
+  console.log('  3. Click into her draft → review → Approve & activate');
+  console.log('  4. From her /profile page → Import history from Spinach');
   process.exit(0);
 }
 

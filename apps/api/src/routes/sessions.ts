@@ -18,6 +18,7 @@ import { Errors } from '@wgc/shared';
 import { loadEnv } from '@wgc/config';
 import type { AppEnv } from '../app.js';
 import { requireRole } from '../middleware/auth.js';
+import { idempotency } from '../middleware/idempotency.js';
 import { enqueueTaskSync } from '../lib/sync-outbox.js';
 import { runSessionPipeline } from '../lib/session-pipeline.js';
 import { runPassBSweep, runWorker7PassB } from '../lib/meeting-prep.js';
@@ -238,12 +239,24 @@ const BulkDecisionSchema = z.object({
     .min(1),
 });
 
-sessionsCounsellorRoutes.post('/draft-tasks/bulk-decision', async (c) => {
+sessionsCounsellorRoutes.post('/draft-tasks/bulk-decision', idempotency, async (c) => {
   const auth = requireRole(c, 'counsellor');
   const body = BulkDecisionSchema.parse(await c.req.json());
   const ids = body.decisions.map((d) => d.taskId);
   const drafts = await db.select().from(tasks).where(inArray(tasks.id, ids));
   const draftById = new Map(drafts.map((t) => [t.id, t]));
+
+  // Batch the student ↔ counsellor lookups in one query instead of one per
+  // draft (was N+1: 20 draft tasks → 20 round-trips).
+  const studentIds = [...new Set(drafts.map((t) => t.studentId))];
+  const studentRows =
+    studentIds.length > 0
+      ? await db
+          .select({ id: students.id, counsellorId: students.counsellorId })
+          .from(students)
+          .where(inArray(students.id, studentIds))
+      : [];
+  const studentCounsellor = new Map(studentRows.map((s) => [s.id, s.counsellorId]));
 
   let approved = 0;
   let rejected = 0;
@@ -252,10 +265,7 @@ sessionsCounsellorRoutes.post('/draft-tasks/bulk-decision', async (c) => {
     if (!t) continue;
     if (t.status !== 'draft') continue;
     // Authorise against the assigned student↔counsellor relationship.
-    const stu = (
-      await db.select({ counsellorId: students.counsellorId }).from(students).where(eq(students.id, t.studentId)).limit(1)
-    )[0];
-    if (!stu || stu.counsellorId !== auth.subjectId) continue;
+    if (studentCounsellor.get(t.studentId) !== auth.subjectId) continue;
 
     if (d.action === 'reject') {
       await db.update(tasks).set({ status: 'cancelled' }).where(eq(tasks.id, t.id));
@@ -448,10 +458,13 @@ sessionsCounsellorRoutes.patch('/gaps/:id', async (c) => {
 
 sessionsCounsellorRoutes.get('/todos', async (c) => {
   const auth = requireRole(c, 'counsellor');
+  const studentId = c.req.query('studentId');
+  const conds = [eq(counsellorTodos.counsellorId, auth.subjectId)];
+  if (studentId) conds.push(eq(counsellorTodos.studentId, studentId));
   const rows = await db
     .select()
     .from(counsellorTodos)
-    .where(eq(counsellorTodos.counsellorId, auth.subjectId))
+    .where(and(...conds))
     .orderBy(desc(counsellorTodos.createdAt))
     .limit(100);
   return c.json({ data: rows });

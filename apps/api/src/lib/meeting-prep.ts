@@ -12,6 +12,8 @@ import {
 } from '@wgc/db';
 import { AIClient } from '@wgc/ai';
 import { logger } from '../logger.js';
+import { loadOnboardingProfile } from './onboarding-profile.js';
+import { getCurrentRollingSummary } from './student-history.js';
 
 /**
  * Generate the Pass B brief for an upcoming session. Idempotent —
@@ -120,6 +122,15 @@ export async function runWorker7PassB(targetSessionId: string): Promise<string> 
     .map((g) => `[${g.category}${g.subject ? `:${g.subject}` : ''}] ${g.description}`)
     .join('\n');
 
+  // Seed context: immutable onboarding profile + rolling longitudinal
+  // summary. These give the brief a stable "who this student is" baseline
+  // plus the woven story of past meetings, so the model isn't relying on
+  // just the last 6 raw summaries.
+  const [onboarding, rollingHistory] = await Promise.all([
+    loadOnboardingProfile(student.id),
+    getCurrentRollingSummary(student.id),
+  ]);
+
   const ai = new AIClient();
   const result = await ai.call({
     workerName: 'worker_7_meeting_prep',
@@ -131,6 +142,8 @@ export async function runWorker7PassB(targetSessionId: string): Promise<string> 
       student_grade: student.currentGrade,
       upcoming_session_at: session.scheduledAt.toISOString(),
       pass_a_content: passAContent,
+      onboarding_profile: onboarding?.aiProfile ?? '',
+      rolling_history: rollingHistory || '(no rolling history yet)',
       recent_summaries: recentSummaries || '(no prior sessions)',
       tasks_summary: tasksSummary || '(no tasks in period)',
       recent_signals: recentSignalsRendered || '(none)',

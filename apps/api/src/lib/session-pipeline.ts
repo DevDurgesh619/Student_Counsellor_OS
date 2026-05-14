@@ -18,6 +18,8 @@ import {
 import { AIClient } from '@wgc/ai';
 import { SUBJECTS } from '@wgc/shared';
 import { logger } from '../logger.js';
+import { loadOnboardingProfile } from './onboarding-profile.js';
+import { getCurrentRollingSummary } from './student-history.js';
 
 // ---------- Zod schemas for AI outputs ----------
 
@@ -80,11 +82,24 @@ const TimetableDraftSchema = z.object({
 
 // ---------- Public entry point ----------
 
+export type RunSessionPipelineOptions = {
+  /**
+   * Skip the Worker 4 timetable drafter. Used by the historical-import
+   * backfill flow: historical meetings shouldn't propose new recurring
+   * tasks (and the worker is currently expensive — see the pre-existing
+   * truncation bug). Pass A brief + extraction + action items still run.
+   */
+  skipTimetableDraft?: boolean;
+};
+
 /**
  * Run the post-session pipeline against a session that has a transcript.
  * Idempotent: re-running atomically replaces extraction + downstream drafts.
  */
-export async function runSessionPipeline(sessionId: string): Promise<{
+export async function runSessionPipeline(
+  sessionId: string,
+  opts: RunSessionPipelineOptions = {},
+): Promise<{
   extractionId: string;
   passABriefId: string | null;
   draftTaskCount: number;
@@ -139,8 +154,15 @@ export async function runSessionPipeline(sessionId: string): Promise<{
   });
 
   // Step 4: Worker 4 — gated on extraction.scheduleChangesDiscussed.
+  // Skipped entirely when the caller opted out (e.g. historical-import
+  // backfill, where proposing new recurring tasks from year-old meetings
+  // would be wrong AND expensive).
   let worker4Ran = false;
-  if (extraction.scheduleChangesDiscussed && extraction.confidence !== 'low') {
+  if (
+    !opts.skipTimetableDraft &&
+    extraction.scheduleChangesDiscussed &&
+    extraction.confidence !== 'low'
+  ) {
     try {
       await runWorker4({
         session,
@@ -152,6 +174,8 @@ export async function runSessionPipeline(sessionId: string): Promise<{
     } catch (err) {
       logger.warn({ err, sessionId }, 'worker4 failed; counsellor will see warning');
     }
+  } else if (opts.skipTimetableDraft) {
+    logger.info({ sessionId }, 'worker4 skipped (skipTimetableDraft=true)');
   }
 
   // Surface an extraction-summary review queue item so the counsellor lands on
@@ -268,6 +292,14 @@ async function runWorker7PassA(args: {
     .map((r, i) => `[Session ${i + 1}] ${r.summary ?? '(no summary)'}`)
     .join('\n\n');
 
+  // Seed context: the immutable onboarding profile (so the brief always
+  // knows who this student is) + the rolling longitudinal summary built
+  // from prior meetings (so it never re-derives history from raw summaries).
+  const [onboarding, rollingHistory] = await Promise.all([
+    loadOnboardingProfile(args.student.id),
+    getCurrentRollingSummary(args.student.id),
+  ]);
+
   const ai = new AIClient();
   const result = await ai.call({
     workerName: 'worker_7_meeting_prep',
@@ -279,6 +311,8 @@ async function runWorker7PassA(args: {
       session_date: (args.session.actualStartedAt ?? args.session.scheduledAt).toISOString(),
       extraction_json: args.extraction.rawExtraction ?? {},
       recent_summaries: recentSummaries || '(no prior sessions)',
+      onboarding_profile: onboarding?.aiProfile ?? '',
+      rolling_history: rollingHistory || '(no rolling history yet — this is the first or second meeting)',
     },
   });
 

@@ -4,6 +4,7 @@ import Link from 'next/link';
 import { useMemo, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { ChevronLeft, ChevronRight } from 'lucide-react';
+import { format } from 'date-fns';
 import { studentApi, type StudentTask } from '@/lib/api';
 
 function isoDay(d: Date) {
@@ -53,8 +54,7 @@ export default function WeekPage() {
         <div>
           <h1 className="text-2xl font-semibold">Week</h1>
           <p className="text-sm text-muted-foreground">
-            {days[0]!.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })} –{' '}
-            {days[6]!.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}
+            {format(days[0]!, 'MMM d')} – {format(days[6]!, 'MMM d')}
           </p>
         </div>
         <div className="flex gap-1">
@@ -97,12 +97,8 @@ export default function WeekPage() {
                 className="flex items-center justify-between rounded-lg border border-border bg-card p-3 hover:bg-muted"
               >
                 <div>
-                  <div className="text-xs text-muted-foreground">
-                    {d.toLocaleDateString(undefined, { weekday: 'short' })}
-                  </div>
-                  <div className="font-medium">
-                    {d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}
-                  </div>
+                  <div className="text-xs text-muted-foreground">{format(d, 'EEE')}</div>
+                  <div className="font-medium">{format(d, 'MMM d')}</div>
                 </div>
                 <div className="text-right text-sm">
                   <div className="text-muted-foreground">{total} tasks</div>

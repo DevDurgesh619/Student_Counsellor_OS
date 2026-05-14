@@ -38,6 +38,12 @@ this week." Do not invent content.
 Student: {{student_name}} (grade {{student_grade}})
 Upcoming session at: {{upcoming_session_at}}
 
+Approved onboarding profile (immutable baseline — who this student is):
+{{onboarding_profile}}
+
+Rolling longitudinal summary (the story so far, built from prior meetings):
+{{rolling_history}}
+
 Pass A draft (existing continuity notes — supersede with this brief):
 {{pass_a_content}}
 

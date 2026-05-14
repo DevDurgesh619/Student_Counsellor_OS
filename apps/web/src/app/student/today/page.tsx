@@ -2,7 +2,9 @@
 
 import Link from 'next/link';
 import { useMemo } from 'react';
+import { useSearchParams } from 'next/navigation';
 import { useQuery } from '@tanstack/react-query';
+import { format, parseISO } from 'date-fns';
 import { meApi, studentApi, type StudentTask } from '@/lib/api';
 import { cn } from '@/lib/utils';
 
@@ -11,13 +13,21 @@ function todayISO() {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
 
+const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
+
+// date-fns format strings are locale-stable, so SSR and client agree
+// (toLocaleDateString / toLocaleTimeString flipped between Node's en-US and
+// the browser's locale and triggered a hydration mismatch).
 function fmtTime(iso: string) {
-  const d = new Date(iso);
-  return d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  return format(new Date(iso), 'h:mm a');
 }
 
 export default function TodayPage() {
-  const date = todayISO();
+  const params = useSearchParams();
+  const today = todayISO();
+  const dateParam = params.get('date');
+  const date = dateParam && ISO_DATE.test(dateParam) ? dateParam : today;
+  const isToday = date === today;
   const { data, isLoading, error } = useQuery({
     queryKey: ['my-tasks', 'today', date],
     queryFn: () => studentApi.tasks({ date }),
@@ -30,15 +40,20 @@ export default function TodayPage() {
     typeof me?.profile?.fullName === 'string'
       ? (me.profile.fullName as string).split(' ')[0]
       : null;
+  const headerDate = isToday ? new Date() : parseISO(date);
 
   return (
     <div className="space-y-4">
       <header>
         <h1 className="text-2xl font-semibold">
-          {firstName ? `Hi, ${firstName}` : 'Today'}
+          {isToday
+            ? firstName
+              ? `Hi, ${firstName}`
+              : 'Today'
+            : format(headerDate, 'EEEE, MMMM d')}
         </h1>
         <p className="text-sm text-muted-foreground">
-          {new Date().toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric' })}
+          {isToday ? format(new Date(), 'EEEE, MMMM d') : 'Looking at another day'}
         </p>
       </header>
 

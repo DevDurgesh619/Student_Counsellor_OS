@@ -1,6 +1,7 @@
 'use client';
 
 import { usePathname } from 'next/navigation';
+import { ActiveStudentPill } from './active-student-pill';
 import { CounsellorSidebar } from './counsellor-sidebar';
 import { StudentBottomNav } from './student-bottom-nav';
 
@@ -26,7 +27,12 @@ export function ConditionalShell({ children }: { children: React.ReactNode }) {
   return (
     <div className="flex min-h-screen">
       <CounsellorSidebar />
-      <main className="flex-1 overflow-auto p-6">{children}</main>
+      <div className="flex flex-1 flex-col overflow-hidden">
+        <div className="flex h-10 shrink-0 items-center gap-2 border-b border-border bg-background px-6">
+          <ActiveStudentPill />
+        </div>
+        <main className="flex-1 overflow-auto p-6">{children}</main>
+      </div>
     </div>
   );
 }

@@ -9,6 +9,7 @@ import {
   db,
   reviewQueue,
   sessions as sessionsTable,
+  studentHistorySummaries,
   students,
   tasks,
 } from '@wgc/db';
@@ -17,6 +18,8 @@ import type { AppEnv } from '../app.js';
 import { requireRole } from '../middleware/auth.js';
 import { idempotency } from '../middleware/idempotency.js';
 import { enqueueTaskSync } from '../lib/sync-outbox.js';
+import { backfillStudentSpinach } from '../lib/spinach-poll.js';
+import { listSummaryVersions } from '../lib/student-history.js';
 
 export const counsellorScopedRoutes = new Hono<AppEnv>();
 
@@ -165,6 +168,9 @@ counsellorScopedRoutes.get('/students-overview', async (c) => {
       case 'completed':
         cur.done = row.count;
         break;
+      case 'partial':
+        cur.partial = row.count;
+        break;
       case 'skipped':
         cur.skipped = row.count;
         break;
@@ -306,6 +312,30 @@ counsellorScopedRoutes.get('/students/:id/sessions', async (c) => {
   return c.json({ data: rows });
 });
 
+/**
+ * GET /api/counsellor/students/:id/history-summary
+ *
+ * The rolling longitudinal summary plus its version history. This is the
+ * counsellor's window into the system's long-term memory of the student —
+ * regenerated after every meeting ingest, fed into every brief.
+ */
+counsellorScopedRoutes.get('/students/:id/history-summary', async (c) => {
+  const auth = requireRole(c, 'counsellor');
+  const studentId = c.req.param('id');
+  await assertCounsellorOwnsStudent(auth.subjectId, studentId);
+
+  const current = (
+    await db
+      .select()
+      .from(studentHistorySummaries)
+      .where(eq(studentHistorySummaries.studentId, studentId))
+      .limit(1)
+  )[0];
+
+  const versions = await listSummaryVersions(studentId);
+  return c.json({ current: current ?? null, versions });
+});
+
 counsellorScopedRoutes.post('/students/:id/sessions', idempotency, async (c) => {
   const auth = requireRole(c, 'counsellor');
   const studentId = c.req.param('id');
@@ -352,6 +382,48 @@ counsellorScopedRoutes.patch('/students/:studentId/sessions/:sessionId', async (
     .where(eq(sessionsTable.id, sessionId))
     .returning();
   return c.json(updated[0]);
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Spinach backfill — import a student's historical meetings on demand
+// ─────────────────────────────────────────────────────────────────────────────
+
+const SpinachBackfillSchema = z.object({
+  lookbackDays: z.number().int().positive().max(730).optional(),
+});
+
+/**
+ * POST /api/counsellor/students/:id/spinach-backfill
+ *
+ * Opt-in: walks the counsellor's full Spinach history, finds meetings
+ * auto-matched to this student, ingests them chronologically. Active
+ * students only — archived/pending shouldn't burn LLM budget.
+ *
+ * Synchronous; takes 30s–2min for typical 8–10 meetings. The endpoint
+ * returns the counts (imported / skipped / failed) so the UI can render
+ * a friendly summary.
+ */
+counsellorScopedRoutes.post('/students/:id/spinach-backfill', idempotency, async (c) => {
+  const auth = requireRole(c, 'counsellor');
+  const studentId = c.req.param('id');
+  await assertCounsellorOwnsStudent(auth.subjectId, studentId);
+
+  const studentRow = (
+    await db.select({ status: students.status }).from(students).where(eq(students.id, studentId)).limit(1)
+  )[0];
+  if (!studentRow) throw Errors.notFound('student', studentId);
+  if (studentRow.status !== 'active') {
+    throw Errors.conflict(
+      'STUDENT_NOT_ACTIVE',
+      'Backfill is only available for active students',
+    );
+  }
+
+  const body = SpinachBackfillSchema.parse(await c.req.json().catch(() => ({})));
+  const result = await backfillStudentSpinach(auth.subjectId, studentId, {
+    lookbackDays: body.lookbackDays,
+  });
+  return c.json(result);
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
