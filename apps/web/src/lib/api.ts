@@ -246,10 +246,24 @@ export const counsellorApi = {
       targetResolutionDate: string | null;
     }>,
   ) => api<unknown>(`/api/counsellor/gaps/${gapId}`, { method: 'PATCH', body }),
-  todos: (studentId?: string) =>
-    api<{ data: CounsellorTodoRow[] }>('/api/counsellor/todos', { query: { studentId } }),
-  patchTodo: (id: string, body: { status: 'pending' | 'completed' | 'cancelled' }) =>
+  todos: (opts: { studentId?: string; status?: string; lastSessions?: number } = {}) =>
+    api<{ data: CounsellorTodoRow[] }>('/api/counsellor/todos', {
+      query: {
+        studentId: opts.studentId,
+        status: opts.status,
+        lastSessions: opts.lastSessions,
+      },
+    }),
+  patchTodo: (id: string, body: { status: 'pending' | 'completed' | 'archived' }) =>
     api<unknown>(`/api/counsellor/todos/${id}`, { method: 'PATCH', body }),
+  bulkArchiveTodos: (opts: { studentId?: string } = {}) =>
+    api<{ archived: number }>('/api/counsellor/todos/bulk-archive', {
+      method: 'POST',
+      body: opts,
+      idempotencyKey: crypto.randomUUID(),
+    }),
+  deleteTodo: (id: string) =>
+    api<{ ok: boolean }>(`/api/counsellor/todos/${id}`, { method: 'DELETE' }),
 
   // ── Spinach MCP integration
   spinachStatus: () =>
@@ -381,7 +395,7 @@ export type CounsellorTodoRow = {
   description: string;
   sourceSessionId: string | null;
   dueDate: string | null;
-  status: 'pending' | 'completed' | 'cancelled';
+  status: 'pending' | 'completed' | 'cancelled' | 'archived';
   completedAt: string | null;
   createdAt: string;
 };

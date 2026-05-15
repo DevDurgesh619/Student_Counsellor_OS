@@ -1,6 +1,7 @@
 import { and, desc, eq, gte, isNull, lt, or } from 'drizzle-orm';
 import {
   changeRequests,
+  counsellorTodos,
   db,
   gaps,
   meetingPrepBriefs,
@@ -39,9 +40,17 @@ export async function runWorker7PassB(targetSessionId: string): Promise<string> 
   )[0];
   const passAContent = brief?.passAContent ?? '(no Pass A draft was generated)';
 
-  // Last 6 prior session summaries.
+  // Most-recent prior session only. The rolling history summary already
+  // carries the longitudinal arc of every past meeting — the one thing it
+  // can't be trusted for is the *latest* meeting, since it's regenerated
+  // fire-and-forget and runs one meeting behind. So we feed exactly that
+  // gap: the single most-recent session's raw summary.
   const priorSessions = await db
-    .select({ summary: sessions.spinachSummaryText, scheduledAt: sessions.scheduledAt })
+    .select({
+      id: sessions.id,
+      summary: sessions.spinachSummaryText,
+      scheduledAt: sessions.scheduledAt,
+    })
     .from(sessions)
     .where(
       and(
@@ -50,14 +59,36 @@ export async function runWorker7PassB(targetSessionId: string): Promise<string> 
       ),
     )
     .orderBy(desc(sessions.scheduledAt))
-    .limit(6);
-  const recentSummaries = priorSessions
-    .reverse()
-    .map((s) => `[${s.scheduledAt.toISOString().slice(0, 10)}] ${s.summary ?? '(no summary)'}`)
-    .join('\n\n');
+    .limit(1);
+  const lastSession = priorSessions[0] ?? null;
+  const lastSessionSummary = lastSession
+    ? `[${lastSession.scheduledAt.toISOString().slice(0, 10)}] ${lastSession.summary ?? '(no summary)'}`
+    : '';
 
-  // Determine "since last session" window.
-  const lastSessionAt = priorSessions[priorSessions.length - 1]?.scheduledAt
+  // The counsellor's own follow-up items from that last meeting, with
+  // status — so the brief can flag what's still open ("you said you'd
+  // email her chemistry teacher — still pending").
+  const lastSessionTodos = lastSession
+    ? await db
+        .select({
+          description: counsellorTodos.description,
+          status: counsellorTodos.status,
+          dueDate: counsellorTodos.dueDate,
+        })
+        .from(counsellorTodos)
+        .where(eq(counsellorTodos.sourceSessionId, lastSession.id))
+        .limit(30)
+    : [];
+  const lastSessionTodosRendered = lastSessionTodos
+    .map(
+      (t) =>
+        `- [${t.status}] ${t.description}${t.dueDate ? ` (due ${t.dueDate})` : ''}`,
+    )
+    .join('\n');
+
+  // "Since last session" window = from the most recent prior session.
+  const lastSessionAt =
+    lastSession?.scheduledAt
     ?? new Date(session.scheduledAt.getTime() - 7 * 24 * 60 * 60 * 1000);
 
   const periodTasks = await db
@@ -125,7 +156,7 @@ export async function runWorker7PassB(targetSessionId: string): Promise<string> 
   // Seed context: immutable onboarding profile + rolling longitudinal
   // summary. These give the brief a stable "who this student is" baseline
   // plus the woven story of past meetings, so the model isn't relying on
-  // just the last 6 raw summaries.
+  // raw summaries for history.
   const [onboarding, rollingHistory] = await Promise.all([
     loadOnboardingProfile(student.id),
     getCurrentRollingSummary(student.id),
@@ -144,7 +175,8 @@ export async function runWorker7PassB(targetSessionId: string): Promise<string> 
       pass_a_content: passAContent,
       onboarding_profile: onboarding?.aiProfile ?? '',
       rolling_history: rollingHistory || '(no rolling history yet)',
-      recent_summaries: recentSummaries || '(no prior sessions)',
+      last_session_summary: lastSessionSummary || '(no prior sessions)',
+      last_session_todos: lastSessionTodosRendered || '(no counsellor todos from last session)',
       tasks_summary: tasksSummary || '(no tasks in period)',
       recent_signals: recentSignalsRendered || '(none)',
       recent_reports: recentReportsRendered || '(none)',

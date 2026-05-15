@@ -14,6 +14,7 @@ import { AIClient } from '@wgc/ai';
 import type { AppEnv } from '../app.js';
 import { requireRole } from '../middleware/auth.js';
 import { executePlan, type QueryPlan } from '../lib/assistant-retrieval.js';
+import { getCurrentRollingSummary } from '../lib/student-history.js';
 import { logger } from '../logger.js';
 
 export const assistantRoutes = new Hono<AppEnv>();
@@ -96,6 +97,8 @@ const QueryPlanSchema = z.object({
           'sessions',
           'reports',
           'change_requests',
+          'counsellor_todos',
+          'gaps',
         ]),
         timeRange: z
           .object({ from: z.string().optional(), to: z.string().optional() })
@@ -105,7 +108,7 @@ const QueryPlanSchema = z.object({
         limit: z.number().int().positive().max(200).optional(),
       }),
     )
-    .max(6),
+    .max(8),
   needsClarification: z.string().optional(),
 });
 
@@ -211,7 +214,7 @@ assistantRoutes.post('/conversations/:id/messages', async (c) => {
   // Step 2 — retrieval (only when a student is bound to the conversation)
   let retrieved: Record<string, unknown[]> = {};
   if (conv.studentId) {
-    retrieved = await executePlan(conv.studentId, plan);
+    retrieved = await executePlan(conv.studentId, plan, auth.subjectId);
   }
 
   // Step 3 — response generation
@@ -278,6 +281,9 @@ assistantRoutes.post('/conversations/:id/messages', async (c) => {
  *   - the `students` row (basic info)
  *   - the latest approved `student_profile_drafts.profile` (Worker 1 output —
  *     goals, strengths, working sample analysis, parent context, etc.)
+ *   - the rolling history summary (longitudinal narrative built from all
+ *     past meetings). Since there's exactly one per student, it lives here
+ *     in the always-present context rather than being a planner entity.
  *
  * Returns null when the conversation isn't bound to a student.
  */
@@ -299,6 +305,7 @@ async function loadStudentContext(studentId: string | null) {
       .orderBy(desc(studentProfileDrafts.acceptedAt))
       .limit(1)
   )[0];
+  const rollingHistory = await getCurrentRollingSummary(studentId);
   return {
     student: studentRow
       ? {
@@ -312,6 +319,7 @@ async function loadStudentContext(studentId: string | null) {
         }
       : null,
     onboarding_profile: draftRow?.profile ?? null,
+    rolling_history_summary: rollingHistory || null,
   };
 }
 

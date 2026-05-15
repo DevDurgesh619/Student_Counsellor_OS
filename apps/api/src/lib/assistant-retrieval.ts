@@ -3,7 +3,9 @@ import {
   artifacts,
   changeRequests,
   completions,
+  counsellorTodos,
   db,
+  gaps,
   reports,
   sessions,
   tasks,
@@ -14,8 +16,18 @@ export type QueryPlan = {
   needsClarification?: string;
 };
 
+export type PlannedEntity =
+  | 'tasks'
+  | 'completions'
+  | 'artifacts'
+  | 'sessions'
+  | 'reports'
+  | 'change_requests'
+  | 'counsellor_todos'
+  | 'gaps';
+
 export type PlannedQuery = {
-  entity: 'tasks' | 'completions' | 'artifacts' | 'sessions' | 'reports' | 'change_requests';
+  entity: PlannedEntity;
   timeRange?: { from?: string; to?: string };
   subjects?: string[];
   statuses?: string[];
@@ -28,13 +40,18 @@ const MAX_ROWS_PER_ENTITY = 100;
  * Execute a planned-retrieval batch against Postgres. The plan is whatever
  * the query-planner LLM produced; we treat it as untrusted hints (whitelist
  * entities, cap row counts) so a malformed plan can never escalate.
+ *
+ * `counsellorId`, when provided, scopes `counsellor_todos` to that counsellor
+ * as well as the student — defense-in-depth so the assistant can never read
+ * another counsellor's todos.
  */
 export async function executePlan(
   studentId: string,
   plan: QueryPlan,
+  counsellorId?: string,
 ): Promise<Record<string, unknown[]>> {
   const out: Record<string, unknown[]> = {};
-  for (const q of plan.queries.slice(0, 6)) {
+  for (const q of plan.queries.slice(0, 8)) {
     const limit = Math.min(q.limit ?? 50, MAX_ROWS_PER_ENTITY);
     const fromDate = q.timeRange?.from ? parseRelative(q.timeRange.from) : null;
     const toDate = q.timeRange?.to && q.timeRange.to !== 'now' ? parseRelative(q.timeRange.to) : null;
@@ -143,6 +160,50 @@ export async function executePlan(
         .from(changeRequests)
         .where(and(...conds))
         .orderBy(desc(changeRequests.requestedAt))
+        .limit(limit);
+    } else if (q.entity === 'counsellor_todos') {
+      // The counsellor's own follow-up items for this student. Scoped to
+      // both student AND counsellor when counsellorId is supplied.
+      const conds = [eq(counsellorTodos.studentId, studentId)];
+      if (counsellorId) conds.push(eq(counsellorTodos.counsellorId, counsellorId));
+      if (fromDate) conds.push(gte(counsellorTodos.createdAt, fromDate));
+      if (toDate) conds.push(lte(counsellorTodos.createdAt, toDate));
+      if (q.statuses?.length) conds.push(inArray(counsellorTodos.status, q.statuses));
+      out['counsellor_todos'] = await db
+        .select({
+          id: counsellorTodos.id,
+          description: counsellorTodos.description,
+          status: counsellorTodos.status,
+          due_date: counsellorTodos.dueDate,
+          source_session_id: counsellorTodos.sourceSessionId,
+          completed_at: counsellorTodos.completedAt,
+          created_at: counsellorTodos.createdAt,
+        })
+        .from(counsellorTodos)
+        .where(and(...conds))
+        .orderBy(desc(counsellorTodos.createdAt))
+        .limit(limit);
+    } else if (q.entity === 'gaps') {
+      // Learning gaps flagged for this student (by category/subject/priority).
+      const conds = [eq(gaps.studentId, studentId)];
+      if (q.subjects?.length) conds.push(inArray(gaps.subject, q.subjects));
+      if (q.statuses?.length) conds.push(inArray(gaps.status, q.statuses));
+      out['gaps'] = await db
+        .select({
+          id: gaps.id,
+          category: gaps.category,
+          subject: gaps.subject,
+          description: gaps.description,
+          priority: gaps.priority,
+          status: gaps.status,
+          identified_via: gaps.identifiedVia,
+          target_resolution_date: gaps.targetResolutionDate,
+          addressed_at: gaps.addressedAt,
+          created_at: gaps.createdAt,
+        })
+        .from(gaps)
+        .where(and(...conds))
+        .orderBy(desc(gaps.createdAt))
         .limit(limit);
     }
   }

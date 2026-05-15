@@ -459,14 +459,43 @@ sessionsCounsellorRoutes.patch('/gaps/:id', async (c) => {
 sessionsCounsellorRoutes.get('/todos', async (c) => {
   const auth = requireRole(c, 'counsellor');
   const studentId = c.req.query('studentId');
-  const conds = [eq(counsellorTodos.counsellorId, auth.subjectId)];
+  // status: comma-separated. Default to the active tiers — archived is
+  // excluded unless explicitly requested (the "Show archived" toggle).
+  const statusParam = c.req.query('status');
+  const statuses = statusParam
+    ? statusParam.split(',').map((s) => s.trim()).filter(Boolean)
+    : ['pending', 'completed'];
+  // lastSessions: restrict todos to those generated from the student's N
+  // most-recent sessions. Only meaningful in student scope (a meeting count
+  // doesn't translate across students), so it's ignored without studentId.
+  const lastSessionsRaw = c.req.query('lastSessions');
+  const lastSessions = lastSessionsRaw ? parseInt(lastSessionsRaw, 10) : null;
+
+  const conds = [
+    eq(counsellorTodos.counsellorId, auth.subjectId),
+    inArray(counsellorTodos.status, statuses),
+  ];
   if (studentId) conds.push(eq(counsellorTodos.studentId, studentId));
+
+  if (studentId && lastSessions && lastSessions > 0) {
+    const recentSessions = await db
+      .select({ id: sessions.id })
+      .from(sessions)
+      .where(eq(sessions.studentId, studentId))
+      .orderBy(desc(sessions.scheduledAt))
+      .limit(Math.min(lastSessions, 50));
+    const ids = recentSessions.map((s) => s.id);
+    // No sessions for this student yet → nothing meeting-sourced to show.
+    if (ids.length === 0) return c.json({ data: [] });
+    conds.push(inArray(counsellorTodos.sourceSessionId, ids));
+  }
+
   const rows = await db
     .select()
     .from(counsellorTodos)
     .where(and(...conds))
     .orderBy(desc(counsellorTodos.createdAt))
-    .limit(100);
+    .limit(200);
   return c.json({ data: rows });
 });
 
@@ -474,7 +503,7 @@ sessionsCounsellorRoutes.patch('/todos/:id', async (c) => {
   const auth = requireRole(c, 'counsellor');
   const id = c.req.param('id');
   const body = z
-    .object({ status: z.enum(['pending', 'completed', 'cancelled']) })
+    .object({ status: z.enum(['pending', 'completed', 'archived']) })
     .parse(await c.req.json());
   const todo = (
     await db.select().from(counsellorTodos).where(eq(counsellorTodos.id, id)).limit(1)
@@ -485,8 +514,54 @@ sessionsCounsellorRoutes.patch('/todos/:id', async (c) => {
     .update(counsellorTodos)
     .set({
       status: body.status,
-      completedAt: body.status === 'completed' ? new Date() : null,
+      // completedAt tracks the moment it was checked off; clear it if the
+      // todo is moved back to pending, keep it through archive.
+      completedAt:
+        body.status === 'completed'
+          ? new Date()
+          : body.status === 'pending'
+            ? null
+            : todo.completedAt,
     })
     .where(eq(counsellorTodos.id, id));
+  return c.json({ ok: true });
+});
+
+/**
+ * POST /todos/bulk-archive — flip every 'completed' todo for this counsellor
+ * (optionally scoped to one student) to 'archived'. Powers the
+ * "Clear all completed" button.
+ */
+sessionsCounsellorRoutes.post('/todos/bulk-archive', idempotency, async (c) => {
+  const auth = requireRole(c, 'counsellor');
+  const body = z
+    .object({ studentId: z.string().uuid().optional() })
+    .parse(await c.req.json().catch(() => ({})));
+  const conds = [
+    eq(counsellorTodos.counsellorId, auth.subjectId),
+    eq(counsellorTodos.status, 'completed'),
+  ];
+  if (body.studentId) conds.push(eq(counsellorTodos.studentId, body.studentId));
+  const archived = await db
+    .update(counsellorTodos)
+    .set({ status: 'archived' })
+    .where(and(...conds))
+    .returning({ id: counsellorTodos.id });
+  return c.json({ archived: archived.length });
+});
+
+/**
+ * DELETE /todos/:id — hard delete. Counsellor todos are operational items,
+ * not audit records, so removal is permanent.
+ */
+sessionsCounsellorRoutes.delete('/todos/:id', async (c) => {
+  const auth = requireRole(c, 'counsellor');
+  const id = c.req.param('id');
+  const todo = (
+    await db.select().from(counsellorTodos).where(eq(counsellorTodos.id, id)).limit(1)
+  )[0];
+  if (!todo) throw Errors.notFound('counsellor_todo', id);
+  if (todo.counsellorId !== auth.subjectId) throw Errors.authForbidden('not_assigned');
+  await db.delete(counsellorTodos).where(eq(counsellorTodos.id, id));
   return c.json({ ok: true });
 });

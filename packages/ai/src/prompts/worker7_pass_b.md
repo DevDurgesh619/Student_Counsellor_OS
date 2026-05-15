@@ -35,6 +35,12 @@ Tie each to a reason (a gap, a goal, a recent observation).
 If a section is genuinely empty, write a single line: "Nothing flagged
 this week." Do not invent content.
 
+Important: any of YOUR follow-up todos from the last session that are
+still 'pending' must be surfaced explicitly under "Things to address" —
+the counsellor needs the reminder to close those loops. A todo the
+counsellor committed to and didn't do is a higher priority to flag than
+a generic observation.
+
 Student: {{student_name}} (grade {{student_grade}})
 Upcoming session at: {{upcoming_session_at}}
 
@@ -44,13 +50,18 @@ Approved onboarding profile (immutable baseline — who this student is):
 Rolling longitudinal summary (the story so far, built from prior meetings):
 {{rolling_history}}
 
-Pass A draft (existing continuity notes — supersede with this brief):
+Pass A draft (continuity note written right after the last meeting — supersede with this brief):
 {{pass_a_content}}
 
-Last 4–6 Spinach summaries (oldest first):
-{{recent_summaries}}
+Last session's Spinach summary (the rolling summary above runs one meeting
+behind, so this is the freshest meeting's raw detail):
+{{last_session_summary}}
 
-Tasks since last session (status, completions, skips):
+Your follow-up todos from the last session (what YOU committed to as the
+counsellor — call out anything still 'pending' so you close the loop):
+{{last_session_todos}}
+
+Tasks since last session (the student's study tasks — status, completions, skips):
 {{tasks_summary}}
 
 Recent change requests / voice reflections (may be empty):
