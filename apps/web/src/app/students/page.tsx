@@ -6,6 +6,7 @@ import { useQuery } from '@tanstack/react-query';
 import { Search, UserPlus } from 'lucide-react';
 import { counsellorApi, onboardingApi, type StudentOverview } from '@/lib/api';
 import { cn, formatRelative } from '@/lib/utils';
+import { RecentSpinachActivity } from '@/components/recent-spinach-activity';
 
 type SortKey = 'recent' | 'name' | 'pending';
 
@@ -49,6 +50,8 @@ export default function StudentsOverviewPage() {
 
   return (
     <div className="space-y-6">
+      <RecentSpinachActivity />
+
       <header className="flex items-end justify-between">
         <div>
           <h1 className="text-2xl font-semibold">Students</h1>

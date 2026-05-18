@@ -18,6 +18,7 @@ import {
   calendarPublicRoutes,
 } from './routes/calendar.js';
 import { assistantRoutes } from './routes/assistant.js';
+import { timetableEditorRoutes } from './routes/timetable-editor.js';
 import {
   onboardingCounsellorRoutes,
   onboardingStudentRoutes,
@@ -75,6 +76,7 @@ export function createApp() {
   app.route('/api/counsellor', counsellorScopedRoutes);
   app.route('/api/counsellor', calendarCounsellorRoutes);
   app.route('/api/counsellor/assistant', assistantRoutes);
+  app.route('/api/counsellor', timetableEditorRoutes);
   app.route('/api/counsellor', onboardingCounsellorRoutes);
   app.route('/api/counsellor', sessionsCounsellorRoutes);
   app.route('/api/counsellor', spinachCounsellorRoutes);

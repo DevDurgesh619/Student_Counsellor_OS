@@ -43,7 +43,8 @@ export default function RequestsPage() {
       <header>
         <h1 className="text-2xl font-semibold">My requests</h1>
         <p className="text-sm text-muted-foreground">
-          Ask your counsellor to change something about your schedule.
+          General requests — for anything not tied to a specific task. To change a specific task,
+          click it on your week.
         </p>
       </header>
 

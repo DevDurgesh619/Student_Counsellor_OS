@@ -1,12 +1,18 @@
 import { Hono } from 'hono';
 import { z } from 'zod';
 import { and, asc, eq, gte, lte } from 'drizzle-orm';
-import { db, students, tasks } from '@wgc/db';
+import {
+  db,
+  students,
+  tasks,
+  timetableChanges,
+  type TimetableOp,
+} from '@wgc/db';
 import { Errors, SubjectSchema, TaskFlexibilitySchema, TaskSourceSchema } from '@wgc/shared';
 import type { AppEnv } from '../app.js';
 import { requireRole } from '../middleware/auth.js';
 import { idempotency } from '../middleware/idempotency.js';
-import { enqueueTaskSync } from '../lib/sync-outbox.js';
+import { applyChange } from '../lib/timetable-engine.js';
 
 const CreateTaskSchema = z.object({
   studentId: z.string().uuid(),
@@ -55,6 +61,35 @@ taskRoutes.get('/', async (c) => {
   return c.json({ data: rows });
 });
 
+/**
+ * Helper: create a draft timetable_changes row + apply it. Wraps the audit
+ * boilerplate so each route stays a one-liner. Returns the change id so
+ * callers can fetch the resulting task(s).
+ */
+async function createAndApplyChange(
+  studentId: string,
+  subjectId: string,
+  ops: TimetableOp[],
+  rationale?: string,
+): Promise<string> {
+  const inserted = (
+    await db
+      .insert(timetableChanges)
+      .values({
+        studentId,
+        source: 'counsellor_direct',
+        operations: ops,
+        rationale: rationale ?? null,
+        createdBySubjectId: subjectId,
+        createdByRole: 'counsellor',
+      })
+      .returning({ id: timetableChanges.id })
+  )[0];
+  if (!inserted) throw Errors.internal('failed to create timetable_change row');
+  await applyChange(inserted.id);
+  return inserted.id;
+}
+
 taskRoutes.post('/', idempotency, async (c) => {
   const auth = requireRole(c, 'counsellor');
   const body = CreateTaskSchema.parse(await c.req.json());
@@ -66,16 +101,30 @@ taskRoutes.post('/', idempotency, async (c) => {
   if (!studentRow[0]) throw Errors.notFound('student', body.studentId);
   if (studentRow[0].counsellorId !== auth.subjectId) throw Errors.authForbidden();
 
-  const inserted = await db
-    .insert(tasks)
-    .values({
-      ...body,
-      scheduledStart: new Date(body.scheduledStart),
-      scheduledEnd: new Date(body.scheduledEnd),
-    })
-    .returning();
-  if (inserted[0]) await enqueueTaskSync(inserted[0].id, 'create');
-  return c.json(inserted[0], 201);
+  const changeId = await createAndApplyChange(body.studentId, auth.subjectId, [
+    {
+      op: 'create_task',
+      payload: {
+        scheduled_start: body.scheduledStart,
+        scheduled_end: body.scheduledEnd,
+        subject: body.subject,
+        task_title: body.taskTitle,
+        task_description: body.taskDescription ?? null,
+        expected_output: body.expectedOutput ?? null,
+        flexibility: body.flexibility,
+      },
+    },
+  ]);
+
+  // Return the freshly-created task for backwards compat with the existing client.
+  const created = (
+    await db
+      .select()
+      .from(tasks)
+      .where(eq(tasks.generatedFromChangeId, changeId))
+      .limit(1)
+  )[0];
+  return c.json(created, 201);
 });
 
 /**
@@ -104,19 +153,75 @@ taskRoutes.patch('/:id', async (c) => {
   }
 
   const patch = UpdateTaskSchema.parse(await c.req.json());
-  const { scheduledStart, scheduledEnd, ...rest } = patch;
-  const updated = await db
-    .update(tasks)
-    .set({
-      ...rest,
-      ...(scheduledStart ? { scheduledStart: new Date(scheduledStart) } : {}),
-      ...(scheduledEnd ? { scheduledEnd: new Date(scheduledEnd) } : {}),
-      updatedAt: new Date(),
-    })
-    .where(eq(tasks.id, id))
-    .returning();
-  await enqueueTaskSync(id, 'update');
-  return c.json(updated[0]);
+  const ops: TimetableOp[] = [];
+  // Time changes route through move_task (supersedes); everything else
+  // through edit_task (in-place, with audit).
+  const wantsMove =
+    patch.scheduledStart !== undefined || patch.scheduledEnd !== undefined;
+  if (wantsMove) {
+    ops.push({
+      op: 'move_task',
+      payload: {
+        task_id: id,
+        new_start: patch.scheduledStart ?? existing[0].scheduledStart.toISOString(),
+        new_end: patch.scheduledEnd ?? existing[0].scheduledEnd.toISOString(),
+      },
+    });
+  }
+  const nonTime = {
+    subject: patch.subject,
+    task_title: patch.taskTitle,
+    task_description: patch.taskDescription,
+    expected_output: patch.expectedOutput,
+    flexibility: patch.flexibility,
+    verification_required: patch.verificationRequired,
+  };
+  const hasNonTime = Object.values(nonTime).some((v) => v !== undefined);
+  if (hasNonTime && !wantsMove) {
+    ops.push({ op: 'edit_task', payload: { task_id: id, changes: nonTime } });
+  } else if (hasNonTime && wantsMove) {
+    // After a move, the *new* task id is unknown until applyChange resolves.
+    // For now we apply move first and let edit_task fold into the next change
+    // on the resurfaced row — keeps the engine simple. The caller almost
+    // never combines time + field edits in one PATCH.
+    // Apply move; then run a second change for the field edits against the
+    // new task row.
+  }
+
+  if (ops.length === 0) {
+    return c.json(existing[0]);
+  }
+
+  const changeId = await createAndApplyChange(existing[0].studentId, auth.subjectId, ops);
+
+  if (hasNonTime && wantsMove) {
+    // Find the resurfaced new task and apply the field edits to it.
+    const moved = (
+      await db
+        .select()
+        .from(tasks)
+        .where(eq(tasks.generatedFromChangeId, changeId))
+        .limit(1)
+    )[0];
+    if (moved) {
+      await createAndApplyChange(existing[0].studentId, auth.subjectId, [
+        { op: 'edit_task', payload: { task_id: moved.id, changes: nonTime } },
+      ]);
+    }
+  }
+
+  // Return the now-current task — either the resurfaced new row (if move
+  // happened) or the in-place updated row.
+  const current = wantsMove
+    ? (
+        await db
+          .select()
+          .from(tasks)
+          .where(eq(tasks.generatedFromChangeId, changeId))
+          .limit(1)
+      )[0]
+    : (await db.select().from(tasks).where(eq(tasks.id, id)).limit(1))[0];
+  return c.json(current);
 });
 
 const RescheduleSchema = z.object({
@@ -138,31 +243,20 @@ taskRoutes.post('/:id/reschedule', idempotency, async (c) => {
   if (studentRow[0]?.counsellorId !== auth.subjectId) throw Errors.authForbidden();
 
   const body = RescheduleSchema.parse(await c.req.json());
-
-  // Atomic: mark old as 'rescheduled', insert new row pointing back via rescheduledFromId.
-  const result = await db.transaction(async (tx) => {
-    await tx
-      .update(tasks)
-      .set({ status: 'rescheduled', updatedAt: new Date() })
-      .where(eq(tasks.id, id));
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
-    const { id: _oldId, createdAt: _c, updatedAt: _u, ...rest } = existing[0]!;
-    const inserted = await tx
-      .insert(tasks)
-      .values({
-        ...rest,
-        scheduledStart: new Date(body.newScheduledStart),
-        scheduledEnd: new Date(body.newScheduledEnd),
-        status: 'scheduled',
-        rescheduledFromId: id,
-      })
-      .returning();
-    return inserted[0];
-  });
-  // Old task → delete event; new task → create event.
-  await enqueueTaskSync(id, 'delete');
-  if (result) await enqueueTaskSync(result.id, 'create');
-  return c.json(result, 201);
+  const changeId = await createAndApplyChange(existing[0].studentId, auth.subjectId, [
+    {
+      op: 'move_task',
+      payload: { task_id: id, new_start: body.newScheduledStart, new_end: body.newScheduledEnd },
+    },
+  ]);
+  const created = (
+    await db
+      .select()
+      .from(tasks)
+      .where(eq(tasks.generatedFromChangeId, changeId))
+      .limit(1)
+  )[0];
+  return c.json(created, 201);
 });
 
 /** DELETE /api/tasks/:id — soft-cancel (status='cancelled'). */
@@ -177,11 +271,10 @@ taskRoutes.delete('/:id', async (c) => {
     .where(eq(students.id, existing[0].studentId))
     .limit(1);
   if (studentRow[0]?.counsellorId !== auth.subjectId) throw Errors.authForbidden();
-  const updated = await db
-    .update(tasks)
-    .set({ status: 'cancelled', updatedAt: new Date() })
-    .where(eq(tasks.id, id))
-    .returning();
-  await enqueueTaskSync(id, 'delete');
-  return c.json(updated[0]);
+
+  await createAndApplyChange(existing[0].studentId, auth.subjectId, [
+    { op: 'cancel_task', payload: { task_id: id } },
+  ]);
+  const updated = (await db.select().from(tasks).where(eq(tasks.id, id)).limit(1))[0];
+  return c.json(updated);
 });

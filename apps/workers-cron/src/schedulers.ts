@@ -11,6 +11,7 @@ import type { Logger } from 'pino';
 import { renewExpiringWatchChannels } from './handlers/calendar-watch-renewal.js';
 import { runPassBScheduler } from './handlers/pass-b-scheduler.js';
 import { runSpinachPoll } from './handlers/spinach-poll.js';
+import { runSpinachPollSafety } from './handlers/spinach-poll-safety.js';
 
 export type SchedulerEntry = {
   name: string;
@@ -41,17 +42,27 @@ export const SCHEDULERS: SchedulerEntry[] = [
   },
   {
     name: 'pass_b_24h_check',
-    schedule: '0 * * * *', // hourly
+    schedule: '*/15 * * * *', // every 15 min
     timezone: 'Asia/Kolkata',
-    description: 'Check upcoming sessions and emit Pass B events ~24h before (Phase 6)',
+    description:
+      'Regenerate Pass B briefs whose refresh_at signal has fired (24h before, on reschedule, or after relevant activity)',
     handler: runPassBScheduler,
   },
   {
     name: 'spinach_poll',
     schedule: '*/5 * * * *',
     timezone: 'Asia/Kolkata',
-    description: 'Pull new Spinach meetings every 5 min (Phase 6 — MCP ingestion)',
+    description:
+      'Pull new Spinach meetings every 5 min — activity-gated; skips counsellors with no recent or upcoming sessions',
     handler: runSpinachPoll,
+  },
+  {
+    name: 'spinach_poll_safety',
+    schedule: '0 */6 * * *', // every 6 hours
+    timezone: 'Asia/Kolkata',
+    description:
+      'Safety-net Spinach poll — bypasses the activity gate so ad-hoc meetings without a pre-scheduled session still land',
+    handler: runSpinachPollSafety,
   },
   {
     name: 'calendar_watch_renewal',

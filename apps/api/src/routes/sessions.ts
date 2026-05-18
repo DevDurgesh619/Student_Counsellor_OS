@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import { Hono, type Context } from 'hono';
 import { z } from 'zod';
-import { and, desc, eq, inArray } from 'drizzle-orm';
+import { and, desc, eq, gt, inArray } from 'drizzle-orm';
 import {
   counsellorTodos,
   counsellors,
@@ -12,16 +12,16 @@ import {
   sessions,
   sessionExtractions,
   students,
-  tasks,
+  timetableChanges,
 } from '@wgc/db';
 import { Errors } from '@wgc/shared';
 import { loadEnv } from '@wgc/config';
 import type { AppEnv } from '../app.js';
 import { requireRole } from '../middleware/auth.js';
 import { idempotency } from '../middleware/idempotency.js';
-import { enqueueTaskSync } from '../lib/sync-outbox.js';
 import { runSessionPipeline } from '../lib/session-pipeline.js';
 import { runPassBSweep, runWorker7PassB } from '../lib/meeting-prep.js';
+import { applyChange, summarizeChange } from '../lib/timetable-engine.js';
 import { logger } from '../logger.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -200,14 +200,34 @@ sessionsCounsellorRoutes.get('/sessions/:id/extraction', async (c) => {
   return c.json({ data: row });
 });
 
-sessionsCounsellorRoutes.get('/sessions/:id/draft-tasks', async (c) => {
+/**
+ * GET /sessions/:id/pending-change
+ *
+ * Returns the draft `timetable_changes` row Worker 4 produced for this
+ * session (if any), together with a summary the UI renders as a list of
+ * "would create/cancel" tasks. The draft is atomic — the counsellor
+ * approves or rejects the whole bundle from the session-detail page.
+ * Replaces the legacy per-task draft list (Phase 4b).
+ */
+sessionsCounsellorRoutes.get('/sessions/:id/pending-change', async (c) => {
   const id = c.req.param('id');
   await assertSessionAccess(c, id);
-  const rows = await db
-    .select()
-    .from(tasks)
-    .where(and(eq(tasks.generatedFromSessionId, id), eq(tasks.status, 'draft')));
-  return c.json({ data: rows });
+  const change = (
+    await db
+      .select()
+      .from(timetableChanges)
+      .where(
+        and(
+          eq(timetableChanges.sourceSessionId, id),
+          eq(timetableChanges.status, 'draft'),
+        ),
+      )
+      .orderBy(desc(timetableChanges.createdAt))
+      .limit(1)
+  )[0];
+  if (!change) return c.json({ data: null });
+  const summary = await summarizeChange(change.id);
+  return c.json({ data: { change, summary } });
 });
 
 sessionsCounsellorRoutes.post('/sessions/:id/run-pipeline', async (c) => {
@@ -217,98 +237,86 @@ sessionsCounsellorRoutes.post('/sessions/:id/run-pipeline', async (c) => {
   return c.json({ data: result });
 });
 
-const BulkDecisionSchema = z.object({
-  decisions: z
-    .array(
-      z.object({
-        taskId: z.string().uuid(),
-        action: z.enum(['approve', 'reject', 'edit']),
-        edits: z
-          .object({
-            scheduledStart: z.string().optional(),
-            scheduledEnd: z.string().optional(),
-            taskTitle: z.string().optional(),
-            taskDescription: z.string().nullable().optional(),
-            subject: z.string().optional(),
-            flexibility: z.enum(['fixed', 'preferred', 'flexible']).optional(),
-          })
-          .optional(),
-        notes: z.string().optional(),
-      }),
-    )
-    .min(1),
+const PendingChangeDecisionSchema = z.object({
+  decision: z.enum(['approve', 'reject']),
 });
 
-sessionsCounsellorRoutes.post('/draft-tasks/bulk-decision', idempotency, async (c) => {
-  const auth = requireRole(c, 'counsellor');
-  const body = BulkDecisionSchema.parse(await c.req.json());
-  const ids = body.decisions.map((d) => d.taskId);
-  const drafts = await db.select().from(tasks).where(inArray(tasks.id, ids));
-  const draftById = new Map(drafts.map((t) => [t.id, t]));
+/**
+ * POST /sessions/:id/pending-change/decision
+ *
+ * Approve → applyChange (materialises tasks + recurrence groups, enqueues
+ * calendar sync, marks the change active). Reject → flips status to
+ * 'reverted' without ever applying. Either way the matching review-queue
+ * row is closed. V1: counsellor doesn't edit individual ops here — for
+ * partial accept they open the conversational editor and ask for a
+ * revision (the original Phase 4 design).
+ */
+sessionsCounsellorRoutes.post(
+  '/sessions/:id/pending-change/decision',
+  idempotency,
+  async (c) => {
+    const auth = requireRole(c, 'counsellor');
+    const id = c.req.param('id');
+    await assertSessionAccess(c, id);
+    const body = PendingChangeDecisionSchema.parse(await c.req.json());
 
-  // Batch the student ↔ counsellor lookups in one query instead of one per
-  // draft (was N+1: 20 draft tasks → 20 round-trips).
-  const studentIds = [...new Set(drafts.map((t) => t.studentId))];
-  const studentRows =
-    studentIds.length > 0
-      ? await db
-          .select({ id: students.id, counsellorId: students.counsellorId })
-          .from(students)
-          .where(inArray(students.id, studentIds))
-      : [];
-  const studentCounsellor = new Map(studentRows.map((s) => [s.id, s.counsellorId]));
+    const change = (
+      await db
+        .select()
+        .from(timetableChanges)
+        .where(
+          and(
+            eq(timetableChanges.sourceSessionId, id),
+            eq(timetableChanges.status, 'draft'),
+          ),
+        )
+        .orderBy(desc(timetableChanges.createdAt))
+        .limit(1)
+    )[0];
+    if (!change) throw Errors.notFound('pending_change', id);
 
-  let approved = 0;
-  let rejected = 0;
-  for (const d of body.decisions) {
-    const t = draftById.get(d.taskId);
-    if (!t) continue;
-    if (t.status !== 'draft') continue;
-    // Authorise against the assigned student↔counsellor relationship.
-    if (studentCounsellor.get(t.studentId) !== auth.subjectId) continue;
-
-    if (d.action === 'reject') {
-      await db.update(tasks).set({ status: 'cancelled' }).where(eq(tasks.id, t.id));
-      rejected += 1;
-      continue;
-    }
-    const next: Record<string, unknown> = { status: 'scheduled' };
-    if (d.action === 'edit' && d.edits) {
-      if (d.edits.scheduledStart) next['scheduledStart'] = new Date(d.edits.scheduledStart);
-      if (d.edits.scheduledEnd) next['scheduledEnd'] = new Date(d.edits.scheduledEnd);
-      if (d.edits.taskTitle) next['taskTitle'] = d.edits.taskTitle;
-      if (d.edits.taskDescription !== undefined) next['taskDescription'] = d.edits.taskDescription;
-      if (d.edits.subject) next['subject'] = d.edits.subject;
-      if (d.edits.flexibility) next['flexibility'] = d.edits.flexibility;
-    }
-    await db.update(tasks).set(next).where(eq(tasks.id, t.id));
-    await enqueueTaskSync(t.id, 'create');
-    approved += 1;
-  }
-
-  // If all drafts for a session resolved, close the review queue item.
-  const sessionId = drafts[0]?.generatedFromSessionId;
-  if (sessionId) {
-    const remaining = await db
-      .select({ id: tasks.id })
-      .from(tasks)
-      .where(and(eq(tasks.generatedFromSessionId, sessionId), eq(tasks.status, 'draft')))
-      .limit(1);
-    if (remaining.length === 0) {
+    if (body.decision === 'approve') {
+      const result = await applyChange(change.id);
       await db
         .update(reviewQueue)
-        .set({ status: 'resolved', resolvedAt: new Date(), resolvedBy: auth.subjectId })
+        .set({
+          status: 'resolved',
+          resolvedAt: new Date(),
+          resolvedBy: auth.subjectId,
+          resolutionNotes: 'meeting-extracted change approved',
+        })
         .where(
           and(
             eq(reviewQueue.type, 'draft_timetable_changes'),
-            eq(reviewQueue.referenceId, sessionId),
+            eq(reviewQueue.referenceId, id),
           ),
         );
+      return c.json({ data: { decision: 'approve', ...result } });
     }
-  }
 
-  return c.json({ data: { approved, rejected } });
-});
+    // reject: never applied, just close it out. Don't go through
+    // revertChange (that's for active changes only).
+    await db
+      .update(timetableChanges)
+      .set({ status: 'reverted', revertedAt: new Date() })
+      .where(eq(timetableChanges.id, change.id));
+    await db
+      .update(reviewQueue)
+      .set({
+        status: 'resolved',
+        resolvedAt: new Date(),
+        resolvedBy: auth.subjectId,
+        resolutionNotes: 'meeting-extracted change rejected',
+      })
+      .where(
+        and(
+          eq(reviewQueue.type, 'draft_timetable_changes'),
+          eq(reviewQueue.referenceId, id),
+        ),
+      );
+    return c.json({ data: { decision: 'reject', changeId: change.id } });
+  },
+);
 
 // ── Meeting prep briefs ─────────────────────────────────────────────────────
 
@@ -321,13 +329,18 @@ sessionsCounsellorRoutes.get('/students/:id/upcoming-session-brief', async (c) =
   if (!stu) throw Errors.notFound('student', studentId);
   if (stu.counsellorId !== auth.subjectId) throw Errors.authForbidden('not_assigned');
 
+  // Next session whose scheduled time is in the future. Without the
+  // `gt(scheduledAt, now)` filter this would return the earliest session
+  // ever — typically a months-old historical row with a stale brief
+  // attached — which is the opposite of what the counsellor's "upcoming
+  // brief" view should surface.
   const upcoming = (
     await db
       .select()
       .from(sessions)
-      .where(eq(sessions.studentId, studentId))
+      .where(and(eq(sessions.studentId, studentId), gt(sessions.scheduledAt, new Date())))
       .orderBy(sessions.scheduledAt)
-      .limit(20)
+      .limit(1)
   )[0];
   if (!upcoming) return c.json({ data: null });
 

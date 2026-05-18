@@ -60,6 +60,9 @@ export const Errors = {
     new WgcError({ code: 'VALIDATION_FAILED', message, status: 400, details }),
   conflict: (code: string, message: string, details?: Record<string, unknown>) =>
     new WgcError({ code, message, status: 409, details }),
-  internal: (message = 'An unexpected error occurred', cause?: unknown) =>
-    new WgcError({ code: 'INTERNAL_ERROR', message, status: 500, cause }),
+  internal: (
+    message = 'An unexpected error occurred',
+    cause?: unknown,
+    details?: Record<string, unknown>,
+  ) => new WgcError({ code: 'INTERNAL_ERROR', message, status: 500, cause, details }),
 };

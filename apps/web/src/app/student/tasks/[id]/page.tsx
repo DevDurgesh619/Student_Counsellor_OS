@@ -8,6 +8,7 @@ import { ChevronLeft } from 'lucide-react';
 import { format } from 'date-fns';
 import { studentApi } from '@/lib/api';
 import { ArtifactUploader } from '@/components/artifact-uploader';
+import { RequestTaskChangeDialog } from '@/components/student/request-task-change-dialog';
 
 type Claim = 'done' | 'partial' | 'skipped' | 'couldnt_do';
 
@@ -166,74 +167,19 @@ export default function TaskDetailPage() {
       )}
 
       <section className="border-t border-border pt-4">
-        {!showChange ? (
-          <button
-            onClick={() => setShowChange(true)}
-            className="text-sm text-primary underline"
-          >
-            Request change
-          </button>
-        ) : (
-          <ChangeRequestForm
-            taskId={id}
-            taskTitle={task.taskTitle}
-            onClose={() => setShowChange(false)}
-          />
-        )}
-      </section>
-    </div>
-  );
-}
-
-function ChangeRequestForm({
-  taskId,
-  taskTitle,
-  onClose,
-}: {
-  taskId: string;
-  taskTitle: string;
-  onClose: () => void;
-}) {
-  const [proposedChange, setProposedChange] = useState('');
-  const [reason, setReason] = useState('');
-  const m = useMutation({
-    mutationFn: () =>
-      studentApi.submitChangeRequest({
-        originalTaskId: taskId,
-        proposedChange,
-        reason,
-      }),
-    onSuccess: onClose,
-  });
-  return (
-    <div className="space-y-3 rounded-lg border border-border bg-card p-4">
-      <h3 className="font-medium">Request change for "{taskTitle}"</h3>
-      <input
-        value={proposedChange}
-        onChange={(e) => setProposedChange(e.target.value)}
-        placeholder="What change? (e.g., move to evening)"
-        className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-      />
-      <textarea
-        value={reason}
-        onChange={(e) => setReason(e.target.value)}
-        placeholder="Why?"
-        rows={3}
-        className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-      />
-      <div className="flex gap-2">
         <button
-          disabled={!proposedChange || !reason || m.isPending}
-          onClick={() => m.mutate()}
-          className="flex-1 rounded-md bg-primary py-2 text-sm text-primary-foreground hover:opacity-90 disabled:opacity-60"
+          onClick={() => setShowChange(true)}
+          className="text-sm text-primary underline"
         >
-          {m.isPending ? 'Sending…' : 'Send to counsellor'}
+          Request change
         </button>
-        <button onClick={onClose} className="rounded-md border border-input px-4 py-2 text-sm">
-          Cancel
-        </button>
-      </div>
-      {m.error && <p className="text-sm text-destructive">{(m.error as Error).message}</p>}
+      </section>
+
+      <RequestTaskChangeDialog
+        task={showChange ? task : null}
+        onClose={() => setShowChange(false)}
+        initialMode="request"
+      />
     </div>
   );
 }

@@ -6,6 +6,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
+import { RefreshCcw } from 'lucide-react';
 import { counsellorApi } from '@/lib/api';
 import { formatRelative } from '@/lib/utils';
 
@@ -55,20 +56,49 @@ export default function SessionsPage() {
     defaultValues: { status: 'completed' },
   });
 
+  const refresh = useMutation({
+    mutationFn: () => counsellorApi.refreshStudentSpinach(params.id),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['sessions', params.id] });
+      qc.invalidateQueries({ queryKey: ['spinach-recent-activity'] });
+    },
+  });
+
   return (
     <div className="space-y-4">
-      <div className="flex items-center justify-between">
+      <div className="flex flex-wrap items-center justify-between gap-2">
         <h2 className="text-lg font-medium">Sessions</h2>
-        <button
-          onClick={() => setShowForm((v) => !v)}
-          className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:opacity-90"
-        >
-          {showForm ? 'Close' : '+ Add session'}
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => refresh.mutate()}
+            disabled={refresh.isPending}
+            className="inline-flex items-center gap-1 rounded-md border border-border px-3 py-1.5 text-sm hover:bg-muted disabled:opacity-50"
+          >
+            <RefreshCcw className={refresh.isPending ? 'h-3.5 w-3.5 animate-spin' : 'h-3.5 w-3.5'} />
+            {refresh.isPending ? 'Fetching…' : 'Refresh from Spinach'}
+          </button>
+          <button
+            onClick={() => setShowForm((v) => !v)}
+            className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:opacity-90"
+          >
+            {showForm ? 'Close' : '+ Add session'}
+          </button>
+        </div>
       </div>
       <p className="text-xs text-muted-foreground">
-        Manual entry. Phase 6 wires Spinach so this becomes automatic.
+        Auto-ingested from Spinach. Use &ldquo;Refresh from Spinach&rdquo; if a meeting just ended
+        and isn&apos;t here yet. Manual entry below for sessions that bypass Spinach.
       </p>
+      {refresh.isSuccess && (
+        <p className="text-xs text-success">
+          {refresh.data?.data?.addedForThisStudent
+            ? `Found ${refresh.data.data.addedForThisStudent} new meeting${refresh.data.data.addedForThisStudent === 1 ? '' : 's'} for this student.`
+            : 'No new meetings — Spinach may still be processing. Try again in a few minutes.'}
+        </p>
+      )}
+      {refresh.isError && (
+        <p className="text-xs text-destructive">{(refresh.error as Error).message}</p>
+      )}
 
       {showForm && (
         <form

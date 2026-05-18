@@ -1,6 +1,11 @@
 // Layer 1 — core entities (CLAUDE_CODE.md §8)
 export * from './counsellors.js';
 export * from './students.js';
+// recurrence-groups + timetable-changes ordered before tasks because tasks.ts
+// imports them for FK column refs.
+export * from './timetable-changes.js';
+export * from './recurrence-groups.js';
+export * from './timetable-conversations.js';
 export * from './tasks.js';
 export * from './completions.js';
 export * from './artifacts.js';

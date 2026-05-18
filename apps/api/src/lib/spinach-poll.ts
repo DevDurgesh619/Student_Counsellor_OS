@@ -1,7 +1,8 @@
-import { and, eq, inArray, isNotNull } from 'drizzle-orm';
+import { and, eq, gte, inArray, isNotNull, isNull, lt, lte, or } from 'drizzle-orm';
 import {
   counsellors,
   db,
+  meetingPrepBriefs,
   reviewQueue,
   sessions,
   spinachIngestedMeetings,
@@ -39,8 +40,16 @@ export type PollResult = {
 /**
  * Sweep every counsellor with a stored Spinach token. Called by the
  * 5-min cron via /internal/spinach-poll.
+ *
+ * `opts.skipActivityGate` — when true, polls every counsellor unconditionally.
+ * Used by the 6-hourly safety-net cron so ad-hoc meetings that didn't have
+ * a pre-scheduled `sessions` row still land. The default per-5-min cron
+ * uses the gate to skip counsellors with no recent or upcoming activity,
+ * cutting Spinach API calls ~13×.
  */
-export async function sweepAllCounsellors(): Promise<PollResult> {
+export async function sweepAllCounsellors(
+  opts: { skipActivityGate?: boolean } = {},
+): Promise<PollResult> {
   const rows = await db
     .select({ id: counsellors.id })
     .from(counsellors)
@@ -56,6 +65,16 @@ export async function sweepAllCounsellors(): Promise<PollResult> {
   };
 
   for (const c of rows) {
+    if (!opts.skipActivityGate) {
+      const active = await shouldPollCounsellorNow(c.id);
+      if (!active) {
+        logger.debug(
+          { counsellorId: c.id },
+          'spinach poll: skipping (no activity window)',
+        );
+        continue;
+      }
+    }
     result.counsellorsScanned += 1;
     try {
       const partial = await pollOneCounsellor(c.id);
@@ -73,6 +92,90 @@ export async function sweepAllCounsellors(): Promise<PollResult> {
     }
   }
   return result;
+}
+
+/**
+ * Decide whether a counsellor's Spinach poll is worth running this tick.
+ * Returns true when the counsellor has activity in their immediate
+ * neighbourhood: a meeting just ended, a meeting is about to start, an
+ * upcoming brief needs the latest context, or a follow-up sweep is due
+ * because Spinach just gave us a meeting and might be processing more.
+ *
+ * Without this gate the 5-min cron polls every counsellor every tick,
+ * even if they have nothing happening for days — ~288 polls/counsellor/day
+ * vs ~22 with the gate. The 6-hourly safety-net catches anything the
+ * gate misses (e.g. ad-hoc meetings with no pre-scheduled session).
+ */
+export async function shouldPollCounsellorNow(counsellorId: string): Promise<boolean> {
+  const now = new Date();
+  const ninetyMinAgo = new Date(now.getTime() - 90 * 60 * 1000);
+  const twentyFourHoursAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+  const twelveHoursFromNow = new Date(now.getTime() + 12 * 60 * 60 * 1000);
+  const tenMinAgo = new Date(now.getTime() - 10 * 60 * 1000);
+
+  // 1. Recent transcript window — a scheduled session ended in the last 90 min.
+  const recentEndedSession = await db
+    .select({ id: sessions.id })
+    .from(sessions)
+    .innerJoin(students, eq(students.id, sessions.studentId))
+    .where(
+      and(
+        eq(students.counsellorId, counsellorId),
+        gte(sessions.scheduledAt, ninetyMinAgo),
+        lte(sessions.scheduledAt, now),
+      ),
+    )
+    .limit(1);
+  if (recentEndedSession.length > 0) return true;
+
+  // 2. Late-landing transcript — session in the last 24h has no transcript yet.
+  const staleNoTranscript = await db
+    .select({ id: sessions.id })
+    .from(sessions)
+    .innerJoin(students, eq(students.id, sessions.studentId))
+    .where(
+      and(
+        eq(students.counsellorId, counsellorId),
+        gte(sessions.scheduledAt, twentyFourHoursAgo),
+        lt(sessions.scheduledAt, ninetyMinAgo),
+        isNull(sessions.transcriptText),
+      ),
+    )
+    .limit(1);
+  if (staleNoTranscript.length > 0) return true;
+
+  // 3. Upcoming brief that wants the freshest context — any meeting prep
+  // brief for a session happening in the next 12h.
+  const upcomingBrief = await db
+    .select({ id: meetingPrepBriefs.id })
+    .from(meetingPrepBriefs)
+    .innerJoin(sessions, eq(sessions.id, meetingPrepBriefs.targetSessionId))
+    .innerJoin(students, eq(students.id, sessions.studentId))
+    .where(
+      and(
+        eq(students.counsellorId, counsellorId),
+        gte(sessions.scheduledAt, now),
+        lte(sessions.scheduledAt, twelveHoursFromNow),
+      ),
+    )
+    .limit(1);
+  if (upcomingBrief.length > 0) return true;
+
+  // 4. Follow-up sweep — Spinach just gave us a meeting; check again in
+  // case more are processing in the same batch.
+  const recentIngest = await db
+    .select({ id: spinachIngestedMeetings.id })
+    .from(spinachIngestedMeetings)
+    .where(
+      and(
+        eq(spinachIngestedMeetings.counsellorId, counsellorId),
+        gte(spinachIngestedMeetings.fetchedAt, tenMinAgo),
+      ),
+    )
+    .limit(1);
+  if (recentIngest.length > 0) return true;
+
+  return false;
 }
 
 type PollOneResult = {

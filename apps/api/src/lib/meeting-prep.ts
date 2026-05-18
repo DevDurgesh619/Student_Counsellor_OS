@@ -1,19 +1,15 @@
-import { and, desc, eq, gte, isNull, lt, or } from 'drizzle-orm';
+import { and, asc, desc, eq, gt, gte, inArray, isNotNull, isNull, lt, lte, or } from 'drizzle-orm';
 import {
   changeRequests,
   counsellorTodos,
   db,
-  gaps,
   meetingPrepBriefs,
-  reports,
   reviewQueue,
   sessions,
   students,
-  tasks,
 } from '@wgc/db';
 import { AIClient } from '@wgc/ai';
 import { logger } from '../logger.js';
-import { loadOnboardingProfile } from './onboarding-profile.js';
 import { getCurrentRollingSummary } from './student-history.js';
 
 /**
@@ -33,18 +29,15 @@ export async function runWorker7PassB(targetSessionId: string): Promise<string> 
 
   const brief = (
     await db
-      .select()
+      .select({ id: meetingPrepBriefs.id, passAContent: meetingPrepBriefs.passAContent })
       .from(meetingPrepBriefs)
       .where(eq(meetingPrepBriefs.targetSessionId, targetSessionId))
       .limit(1)
   )[0];
   const passAContent = brief?.passAContent ?? '(no Pass A draft was generated)';
 
-  // Most-recent prior session only. The rolling history summary already
-  // carries the longitudinal arc of every past meeting — the one thing it
-  // can't be trusted for is the *latest* meeting, since it's regenerated
-  // fire-and-forget and runs one meeting behind. So we feed exactly that
-  // gap: the single most-recent session's raw summary.
+  // Single most-recent prior session — its Spinach summary is the freshest
+  // raw detail (the rolling summary runs one meeting behind by design).
   const priorSessions = await db
     .select({
       id: sessions.id,
@@ -65,52 +58,37 @@ export async function runWorker7PassB(targetSessionId: string): Promise<string> 
     ? `[${lastSession.scheduledAt.toISOString().slice(0, 10)}] ${lastSession.summary ?? '(no summary)'}`
     : '';
 
-  // The counsellor's own follow-up items from that last meeting, with
-  // status — so the brief can flag what's still open ("you said you'd
-  // email her chemistry teacher — still pending").
+  // Open counsellor todos tied to the last session — what the counsellor
+  // committed to in that meeting and still owes the student. Scoped to
+  // lastSession.id deliberately (the brief is "what to close before the
+  // next meet", not the lifetime backlog).
   const lastSessionTodos = lastSession
     ? await db
         .select({
           description: counsellorTodos.description,
-          status: counsellorTodos.status,
           dueDate: counsellorTodos.dueDate,
+          createdAt: counsellorTodos.createdAt,
         })
         .from(counsellorTodos)
-        .where(eq(counsellorTodos.sourceSessionId, lastSession.id))
+        .where(
+          and(
+            eq(counsellorTodos.sourceSessionId, lastSession.id),
+            eq(counsellorTodos.status, 'pending'),
+          ),
+        )
+        .orderBy(asc(counsellorTodos.dueDate), asc(counsellorTodos.createdAt))
         .limit(30)
     : [];
   const lastSessionTodosRendered = lastSessionTodos
-    .map(
-      (t) =>
-        `- [${t.status}] ${t.description}${t.dueDate ? ` (due ${t.dueDate})` : ''}`,
-    )
+    .map((t) => `- ${t.description}${t.dueDate ? ` (due ${t.dueDate})` : ''}`)
     .join('\n');
 
-  // "Since last session" window = from the most recent prior session.
-  const lastSessionAt =
+  // Change requests opened since the last session — the student's signals
+  // about scope/timing/recent friction. Window starts at last session
+  // (or 7 days back if no prior session yet) and ends now.
+  const sinceWindow =
     lastSession?.scheduledAt
     ?? new Date(session.scheduledAt.getTime() - 7 * 24 * 60 * 60 * 1000);
-
-  const periodTasks = await db
-    .select({
-      title: tasks.taskTitle,
-      subject: tasks.subject,
-      status: tasks.status,
-      start: tasks.scheduledStart,
-    })
-    .from(tasks)
-    .where(
-      and(
-        eq(tasks.studentId, student.id),
-        gte(tasks.scheduledStart, lastSessionAt),
-        lt(tasks.scheduledStart, session.scheduledAt),
-      ),
-    )
-    .limit(50);
-  const tasksSummary = periodTasks
-    .map((t) => `${t.start.toISOString().slice(0, 10)} ${t.subject} "${t.title}" → ${t.status}`)
-    .join('\n');
-
   const recentSignals = await db
     .select({
       proposed: changeRequests.proposedChange,
@@ -121,46 +99,16 @@ export async function runWorker7PassB(targetSessionId: string): Promise<string> 
     .where(
       and(
         eq(changeRequests.studentId, student.id),
-        gte(changeRequests.requestedAt, lastSessionAt),
+        gte(changeRequests.requestedAt, sinceWindow),
       ),
     )
+    .orderBy(desc(changeRequests.requestedAt))
     .limit(20);
   const recentSignalsRendered = recentSignals
-    .map((s) => `${s.proposed} — reason: ${s.reason}`)
+    .map((s) => `- ${s.proposed} — reason: ${s.reason}`)
     .join('\n');
 
-  const recentReports = await db
-    .select({
-      type: reports.type,
-      content: reports.reviewedContent,
-      draft: reports.draftContent,
-      createdAt: reports.createdAt,
-    })
-    .from(reports)
-    .where(eq(reports.studentId, student.id))
-    .orderBy(desc(reports.createdAt))
-    .limit(2);
-  const recentReportsRendered = recentReports
-    .map((r) => `[${r.type}] ${r.content ?? r.draft ?? '(no content)'}`)
-    .join('\n\n');
-
-  const studentGaps = await db
-    .select({ category: gaps.category, description: gaps.description, subject: gaps.subject })
-    .from(gaps)
-    .where(and(eq(gaps.studentId, student.id), eq(gaps.status, 'active')))
-    .limit(20);
-  const gapsSummary = studentGaps
-    .map((g) => `[${g.category}${g.subject ? `:${g.subject}` : ''}] ${g.description}`)
-    .join('\n');
-
-  // Seed context: immutable onboarding profile + rolling longitudinal
-  // summary. These give the brief a stable "who this student is" baseline
-  // plus the woven story of past meetings, so the model isn't relying on
-  // raw summaries for history.
-  const [onboarding, rollingHistory] = await Promise.all([
-    loadOnboardingProfile(student.id),
-    getCurrentRollingSummary(student.id),
-  ]);
+  const rollingHistory = await getCurrentRollingSummary(student.id);
 
   const ai = new AIClient();
   const result = await ai.call({
@@ -172,15 +120,12 @@ export async function runWorker7PassB(targetSessionId: string): Promise<string> 
       student_name: student.fullName,
       student_grade: student.currentGrade,
       upcoming_session_at: session.scheduledAt.toISOString(),
-      pass_a_content: passAContent,
-      onboarding_profile: onboarding?.aiProfile ?? '',
       rolling_history: rollingHistory || '(no rolling history yet)',
       last_session_summary: lastSessionSummary || '(no prior sessions)',
-      last_session_todos: lastSessionTodosRendered || '(no counsellor todos from last session)',
-      tasks_summary: tasksSummary || '(no tasks in period)',
-      recent_signals: recentSignalsRendered || '(none)',
-      recent_reports: recentReportsRendered || '(none)',
-      gaps_summary: gapsSummary || '(no active gaps)',
+      last_session_todos:
+        lastSessionTodosRendered || '(no open counsellor todos from the last session)',
+      recent_signals: recentSignalsRendered || '(no new change requests since last session)',
+      pass_a_content: passAContent,
     },
   });
 
@@ -192,6 +137,9 @@ export async function runWorker7PassB(targetSessionId: string): Promise<string> 
         passBContent: result.rawResponse,
         passBGeneratedAt: now,
         status: 'pass_b_ready',
+        // Clear the refresh signal — the next reschedule or significant
+        // student activity will set it again.
+        refreshAt: null,
         updatedAt: now,
       })
       .where(eq(meetingPrepBriefs.id, brief.id));
@@ -232,37 +180,48 @@ export async function runWorker7PassB(targetSessionId: string): Promise<string> 
 }
 
 /**
- * Find sessions scheduled 24h–25h from now whose Pass B brief hasn't been
- * generated yet. Returns IDs in chronological order.
+ * Pick briefs that are due for (re)generation. Rules:
+ *   - `refresh_at` is set AND <= now (the explicit "regenerate me now" signal)
+ *   - target session is still in the future (no point regenerating for a
+ *     meeting that already happened)
+ *   - haven't been regenerated since the refresh_at signal landed
+ *
+ * This replaces the old "exactly 24-25h before" window logic which silently
+ * missed sessions created less than 24h before they happened, sessions
+ * rescheduled inside the window, and sessions where new artifacts/
+ * completions changed the context.
  */
-export async function findSessionsNeedingPassB(now: Date = new Date()): Promise<string[]> {
-  const lower = new Date(now.getTime() + 24 * 60 * 60 * 1000);
-  const upper = new Date(now.getTime() + 25 * 60 * 60 * 1000);
-
-  // LEFT JOIN-ish via two queries: pull sessions in window, then exclude
-  // those that already have pass_b_content.
-  const inWindow = await db
-    .select({ id: sessions.id })
-    .from(sessions)
+export async function findBriefsNeedingPassB(
+  now: Date = new Date(),
+  limit = 20,
+): Promise<string[]> {
+  const rows = await db
+    .select({
+      sessionId: meetingPrepBriefs.targetSessionId,
+    })
+    .from(meetingPrepBriefs)
+    .innerJoin(sessions, eq(sessions.id, meetingPrepBriefs.targetSessionId))
     .where(
       and(
-        gte(sessions.scheduledAt, lower),
-        lt(sessions.scheduledAt, upper),
-        or(eq(sessions.status, 'scheduled'), isNull(sessions.status)),
+        isNotNull(meetingPrepBriefs.refreshAt),
+        lte(meetingPrepBriefs.refreshAt, now),
+        gt(sessions.scheduledAt, now),
+        or(
+          isNull(meetingPrepBriefs.passBGeneratedAt),
+          lt(meetingPrepBriefs.passBGeneratedAt, meetingPrepBriefs.refreshAt),
+        ),
       ),
-    );
-  const ids = inWindow.map((s) => s.id);
-  if (ids.length === 0) return [];
-
-  const briefs = await db
-    .select({ targetSessionId: meetingPrepBriefs.targetSessionId, passB: meetingPrepBriefs.passBContent })
-    .from(meetingPrepBriefs);
-  const haveB = new Set(briefs.filter((b) => b.passB).map((b) => b.targetSessionId));
-  return ids.filter((id) => !haveB.has(id));
+    )
+    .orderBy(asc(sessions.scheduledAt))
+    .limit(limit);
+  return rows.map((r) => r.sessionId);
 }
 
+/** Backward-compatible alias — older callers grep for this name. */
+export const findSessionsNeedingPassB = findBriefsNeedingPassB;
+
 export async function runPassBSweep(): Promise<{ generated: number; failed: number }> {
-  const ids = await findSessionsNeedingPassB();
+  const ids = await findBriefsNeedingPassB();
   let generated = 0;
   let failed = 0;
   for (const id of ids) {
@@ -275,4 +234,40 @@ export async function runPassBSweep(): Promise<{ generated: number; failed: numb
     }
   }
   return { generated, failed };
+}
+
+/**
+ * Bump `refresh_at` on every brief for an upcoming session of this
+ * student. Called when something changed that the brief should know about
+ * — new artifact, new completion, new change request, new counsellor todo,
+ * session reschedule. The cron picks it up within ~15 min.
+ *
+ * `withinHours` caps how far in the future to bother bumping (default 48h
+ * — beyond that, the next 24h-before refresh will still capture the change
+ * naturally).
+ */
+export async function markStudentBriefsForRefresh(
+  studentId: string,
+  withinHours = 48,
+): Promise<number> {
+  const now = new Date();
+  const horizon = new Date(now.getTime() + withinHours * 60 * 60 * 1000);
+  const upcoming = await db
+    .select({ id: sessions.id })
+    .from(sessions)
+    .where(
+      and(
+        eq(sessions.studentId, studentId),
+        gt(sessions.scheduledAt, now),
+        lte(sessions.scheduledAt, horizon),
+      ),
+    );
+  if (upcoming.length === 0) return 0;
+  const sessionIds = upcoming.map((r) => r.id);
+  const result = await db
+    .update(meetingPrepBriefs)
+    .set({ refreshAt: new Date(now.getTime() + 5 * 60 * 1000), updatedAt: now })
+    .where(inArray(meetingPrepBriefs.targetSessionId, sessionIds))
+    .returning({ id: meetingPrepBriefs.id });
+  return result.length;
 }

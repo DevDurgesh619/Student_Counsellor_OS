@@ -1,4 +1,4 @@
-import { and, desc, eq, gte, lte, ne } from 'drizzle-orm';
+import { and, desc, eq, gte, isNull, lte, ne } from 'drizzle-orm';
 import { z } from 'zod';
 import {
   counsellorTodos,
@@ -6,20 +6,25 @@ import {
   db,
   gaps,
   meetingPrepBriefs,
+  recurrenceGroups,
   reviewQueue,
   sessions,
   sessionExtractions,
   students,
   tasks,
+  timetableChanges,
   type ExtractedActionItem,
   type ExtractedScheduleChange,
   type SessionExtraction,
+  type TimetableOp,
 } from '@wgc/db';
 import { AIClient } from '@wgc/ai';
 import { SUBJECTS } from '@wgc/shared';
 import { logger } from '../logger.js';
 import { loadOnboardingProfile } from './onboarding-profile.js';
 import { getCurrentRollingSummary } from './student-history.js';
+import { Worker4OutputSchema } from './timetable-op-schemas.js';
+import { validateOperations } from './timetable-engine.js';
 
 // ---------- Zod schemas for AI outputs ----------
 
@@ -57,28 +62,10 @@ const ExtractionSchema = z.object({
   confidence: z.enum(['low', 'normal', 'high']).default('normal'),
 });
 
-const TimetableDraftSchema = z.object({
-  drafts: z
-    .array(
-      z.object({
-        action: z.enum(['create', 'cancel', 'edit']),
-        source_change_index: z.number().int().nonnegative(),
-        task_id: z.string().nullable().optional(),
-        scheduled_start: z.string().optional(),
-        scheduled_end: z.string().optional(),
-        subject: z.string().optional(),
-        task_title: z.string().optional(),
-        task_description: z.string().nullable().optional(),
-        expected_output: z.string().nullable().optional(),
-        recurrence_pattern: z.string().nullable().optional(),
-        flexibility: z.enum(['fixed', 'preferred', 'flexible']).optional(),
-        conflicts_with: z.array(z.string()).default([]),
-        rationale: z.string().optional(),
-      }),
-    )
-    .default([]),
-  warnings: z.array(z.string()).default([]),
-});
+// Worker 4 now uses the shared ops vocabulary (see ./timetable-op-schemas.ts).
+// The previous `drafts[]` abstraction was silently dropping `edit` and `move`
+// intents and exploding recurring proposals into N unlinked create ops —
+// see the Phase-4b follow-up plan for the gory details.
 
 // ---------- Public entry point ----------
 
@@ -325,12 +312,19 @@ async function runWorker7PassA(args: {
       .limit(1)
   )[0];
   const now = new Date();
+  // Schedule Pass B for ~24h before the target session. If the target is
+  // already < 24h away (or is the same session, when there's no upcoming
+  // one), regenerate within 5 minutes.
+  const targetAt = upcoming?.scheduledAt ?? args.session.scheduledAt;
+  const refreshIdeal = new Date(targetAt.getTime() - 24 * 60 * 60 * 1000);
+  const refreshAt = refreshIdeal > now ? refreshIdeal : new Date(now.getTime() + 5 * 60 * 1000);
   if (existing) {
     await db
       .update(meetingPrepBriefs)
       .set({
         passAContent: result.rawResponse,
         passAGeneratedAt: now,
+        refreshAt,
         updatedAt: now,
       })
       .where(eq(meetingPrepBriefs.id, existing.id));
@@ -342,6 +336,7 @@ async function runWorker7PassA(args: {
       targetSessionId,
       passAContent: result.rawResponse,
       passAGeneratedAt: now,
+      refreshAt,
       status: 'pass_a_only',
     })
     .returning({ id: meetingPrepBriefs.id });
@@ -431,7 +426,18 @@ async function runWorker4(args: {
   extraction: SessionExtraction;
   counsellorId: string;
 }): Promise<void> {
-  // Idempotency: drop any existing drafts from a prior run for this session.
+  // Idempotency: drop any existing draft change from a prior run for this
+  // session, plus any legacy status='draft' task rows the old worker left
+  // behind (pre-Phase-4b path). Once those rows are gone the only review
+  // surface is the new pending-change endpoint.
+  await db
+    .delete(timetableChanges)
+    .where(
+      and(
+        eq(timetableChanges.sourceSessionId, args.session.id),
+        eq(timetableChanges.status, 'draft'),
+      ),
+    );
   await db
     .delete(tasks)
     .where(
@@ -474,6 +480,36 @@ async function runWorker4(args: {
     )
     .join('\n');
 
+  // Pull active recurrence groups so the worker can reach for real
+  // group_ids when proposing cancel_recurrence / edit_recurrence ops —
+  // without this it would have to invent uuids (which the validator
+  // rejects).
+  const activeGroups = await db
+    .select({
+      id: recurrenceGroups.id,
+      subject: recurrenceGroups.subject,
+      taskTitle: recurrenceGroups.taskTitle,
+      ruleJson: recurrenceGroups.ruleJson,
+      startsOn: recurrenceGroups.startsOn,
+      endsOn: recurrenceGroups.endsOn,
+    })
+    .from(recurrenceGroups)
+    .where(
+      and(
+        eq(recurrenceGroups.studentId, args.student.id),
+        isNull(recurrenceGroups.supersededAt),
+      ),
+    )
+    .limit(50);
+  const dayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  const existingGroupsRendered = activeGroups
+    .map((g) => {
+      const r = g.ruleJson;
+      const days = r.days_of_week.map((d) => dayNames[d] ?? d).join('/');
+      return `${g.id} | ${r.frequency} ${days} ${r.start_time} (${r.duration_min}min) | ${g.subject} | ${g.taskTitle} | ${g.startsOn}→${g.endsOn}`;
+    })
+    .join('\n');
+
   const studentGaps = await db
     .select({ category: gaps.category, description: gaps.description, subject: gaps.subject })
     .from(gaps)
@@ -489,7 +525,7 @@ async function runWorker4(args: {
     promptId: 'worker4_timetable_draft',
     studentId: args.student.id,
     sessionId: args.session.id,
-    outputSchema: TimetableDraftSchema,
+    outputSchema: Worker4OutputSchema,
     inputs: {
       student_name: args.student.fullName,
       student_grade: args.student.currentGrade,
@@ -499,45 +535,74 @@ async function runWorker4(args: {
       allowed_subjects: SUBJECTS.join(', '),
       schedule_changes_json: args.extraction.scheduleChanges,
       existing_tasks: existingTasksRendered || '(none)',
+      existing_recurrence_groups: existingGroupsRendered || '(none)',
       plan_summary: '(not available; plan engine ships in Phase 8)',
       gaps_summary: gapsSummary || '(no active gaps)',
     },
   });
 
+  // The worker now emits ops directly in the closed vocabulary the engine
+  // executes — no translator needed. Normalize subjects on create ops to the
+  // allowed enum (worker is instructed to do this but we belt-and-suspenders
+  // here because the CHECK constraint on tasks.subject would reject a stray
+  // string mid-transaction).
   const allowedSubjects: ReadonlySet<string> = new Set(SUBJECTS as readonly string[]);
-  let createdCount = 0;
-  const drafts = result.output.drafts ?? [];
-  const warnings = result.output.warnings ?? [];
-  for (const draft of drafts) {
-    if (draft.action !== 'create') continue;
-    if (!draft.scheduled_start || !draft.scheduled_end || !draft.subject || !draft.task_title) continue;
-    const subject = allowedSubjects.has(draft.subject) ? draft.subject : 'Other';
-    await db.insert(tasks).values({
-      studentId: args.student.id,
-      scheduledStart: new Date(draft.scheduled_start),
-      scheduledEnd: new Date(draft.scheduled_end),
-      subject,
-      taskTitle: draft.task_title,
-      taskDescription: draft.task_description ?? null,
-      expectedOutput: draft.expected_output ?? null,
-      recurrencePattern: draft.recurrence_pattern ?? null,
-      flexibility: draft.flexibility ?? 'preferred',
-      source: 'ai_drafted_from_session',
-      generatedFromSessionId: args.session.id,
-      status: 'draft',
-    });
-    createdCount += 1;
+  const ops: TimetableOp[] = (result.output.operations ?? []).map((op) => {
+    if (op.op === 'create_task' || op.op === 'create_recurrence') {
+      const subject = allowedSubjects.has(op.payload.subject) ? op.payload.subject : 'Other';
+      return { ...op, payload: { ...op.payload, subject } } as TimetableOp;
+    }
+    return op as TimetableOp;
+  });
+  const workerWarnings = result.output.warnings ?? [];
+
+  if (ops.length === 0 && workerWarnings.length === 0) {
+    return;
   }
 
-  if (createdCount > 0 || warnings.length > 0) {
-    await ensureReviewQueueItem({
-      counsellorId: args.counsellorId,
+  // Pre-flight validation. The engine re-runs this at apply time as a
+  // safety net (see timetable-engine.ts:applyChange), but checking here
+  // gives the counsellor a heads-up on the session page that this draft
+  // won't apply cleanly — and a marker the UI uses to disable the Apply
+  // button so they don't click into a 409.
+  let rationaleSegments: string[] = [];
+  if (ops.length > 0) {
+    const validation = await validateOperations(args.student.id, ops);
+    if (!validation.ok) {
+      rationaleSegments.push(
+        `⚠️ Validation failed before apply:\n${validation.errors.map((e) => `- ${e}`).join('\n')}`,
+      );
+    }
+  }
+  if (workerWarnings.length > 0) {
+    rationaleSegments.push(`Worker warnings: ${workerWarnings.join('; ')}`);
+  }
+  const rationale = rationaleSegments.length > 0 ? rationaleSegments.join('\n\n') : null;
+
+  if (ops.length > 0) {
+    // Persist as a single draft change — counsellor approves/rejects the
+    // whole bundle from the session-detail page. The audit chain back to
+    // the session lives in source_session_id. createdByRole='system'
+    // because the AI worker authored the proposal, not a counsellor click.
+    await db.insert(timetableChanges).values({
       studentId: args.student.id,
-      type: 'draft_timetable_changes',
-      referenceId: args.session.id,
-      priority: 2,
+      source: 'meeting_extraction',
+      status: 'draft',
+      operations: ops,
+      rationale,
+      sourceSessionId: args.session.id,
+      createdBySubjectId: args.counsellorId,
+      createdByRole: 'system',
     });
   }
+
+  await ensureReviewQueueItem({
+    counsellorId: args.counsellorId,
+    studentId: args.student.id,
+    type: 'draft_timetable_changes',
+    referenceId: args.session.id,
+    priority: 2,
+  });
 }
 
 // ---------- Helpers ----------

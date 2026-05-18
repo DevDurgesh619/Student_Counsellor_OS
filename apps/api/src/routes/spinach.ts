@@ -11,6 +11,7 @@ import {
   disconnectSpinach,
   SpinachReauthRequired,
   startSpinachAuth,
+  type SpinachMeetingSummary,
 } from '../lib/spinach-mcp.js';
 import {
   assignInboxMeeting,
@@ -18,6 +19,7 @@ import {
   pollOneCounsellor,
   sweepAllCounsellors,
 } from '../lib/spinach-poll.js';
+import { rankCandidates, type MatchCandidate } from '../lib/spinach-match.js';
 import { logger } from '../logger.js';
 
 // ─── Public OAuth callback (no Bearer auth — Spinach redirects here) ──────
@@ -118,7 +120,74 @@ spinachCounsellorRoutes.get('/spinach/inbox', async (c) => {
     )
     .orderBy(desc(spinachIngestedMeetings.fetchedAt))
     .limit(100);
-  return c.json({ data: rows });
+
+  // For unassigned rows, attach ranked candidate students so the inbox UI
+  // can render "Suggested: Hetvika · high · email match [Assign]" per item.
+  // Skipped for already-linked rows (they have a student already).
+  const withSuggestions =
+    status === 'unassigned'
+      ? await Promise.all(
+          rows.map(async (r) => {
+            const summary: SpinachMeetingSummary = {
+              id: r.spinachMeetingId,
+              title: r.title ?? undefined,
+              scheduledAt: r.scheduledAt ? r.scheduledAt.toISOString() : undefined,
+              attendees: r.attendees,
+            };
+            const suggestions = await rankCandidates(auth.subjectId, summary, null);
+            return { ...r, suggestions };
+          }),
+        )
+      : rows.map((r) => ({ ...r, suggestions: [] as MatchCandidate[] }));
+
+  return c.json({ data: withSuggestions });
+});
+
+/**
+ * POST /spinach/inbox/bulk-auto-assign
+ *
+ * Drain the inbox in one click — assigns every unassigned meeting whose
+ * top candidate is high-confidence. Counsellor manually triages the rest.
+ * Returns counts so the UI can show "Assigned 12, left 8 for manual review."
+ */
+spinachCounsellorRoutes.post('/spinach/inbox/bulk-auto-assign', async (c) => {
+  const auth = requireRole(c, 'counsellor');
+  const rows = await db
+    .select()
+    .from(spinachIngestedMeetings)
+    .where(
+      and(
+        eq(spinachIngestedMeetings.counsellorId, auth.subjectId),
+        eq(spinachIngestedMeetings.status, 'unassigned'),
+      ),
+    )
+    .limit(100);
+
+  let assigned = 0;
+  let skipped = 0;
+  const errors: Array<{ id: string; message: string }> = [];
+  for (const r of rows) {
+    const summary: SpinachMeetingSummary = {
+      id: r.spinachMeetingId,
+      title: r.title ?? undefined,
+      scheduledAt: r.scheduledAt ? r.scheduledAt.toISOString() : undefined,
+      attendees: r.attendees,
+    };
+    const candidates = await rankCandidates(auth.subjectId, summary, null);
+    const top = candidates[0];
+    if (!top || top.confidence !== 'high') {
+      skipped += 1;
+      continue;
+    }
+    try {
+      await assignInboxMeeting(auth.subjectId, r.id, top.studentId);
+      assigned += 1;
+    } catch (err) {
+      errors.push({ id: r.id, message: (err as Error).message });
+    }
+  }
+
+  return c.json({ data: { assigned, skipped, errors } });
 });
 
 spinachCounsellorRoutes.get('/spinach/inbox/:id', async (c) => {
@@ -133,7 +202,20 @@ spinachCounsellorRoutes.get('/spinach/inbox/:id', async (c) => {
   )[0];
   if (!row) throw Errors.notFound('spinach_inbox_meeting', id);
   if (row.counsellorId !== auth.subjectId) throw Errors.authForbidden('not_yours');
-  return c.json({ data: row });
+
+  // Compute suggestions only for unassigned rows — once linked there's no
+  // triage value left.
+  let suggestions: MatchCandidate[] = [];
+  if (row.status === 'unassigned') {
+    const summary: SpinachMeetingSummary = {
+      id: row.spinachMeetingId,
+      title: row.title ?? undefined,
+      scheduledAt: row.scheduledAt ? row.scheduledAt.toISOString() : undefined,
+      attendees: row.attendees,
+    };
+    suggestions = await rankCandidates(auth.subjectId, summary, null);
+  }
+  return c.json({ data: { ...row, suggestions } });
 });
 
 spinachCounsellorRoutes.post('/spinach/inbox/:id/assign', async (c) => {
@@ -165,6 +247,11 @@ function assertInternalSecret(c: Context<AppEnv>): void {
 
 spinachInternalRoutes.post('/spinach-poll', async (c) => {
   assertInternalSecret(c);
-  const result = await sweepAllCounsellors();
+  // Default sweep applies the activity gate (skip counsellors with no
+  // recent or upcoming meeting). `?safety=1` bypasses the gate — used by
+  // the 6-hourly safety-net cron to catch ad-hoc meetings that didn't
+  // have a pre-scheduled `sessions` row.
+  const safety = c.req.query('safety') === '1';
+  const result = await sweepAllCounsellors({ skipActivityGate: safety });
   return c.json({ data: result });
 });

@@ -10,6 +10,7 @@ import { cn } from '@/lib/utils';
 const TABS = [
   { slug: 'today', label: 'Today' },
   { slug: 'week', label: 'Week' },
+  { slug: 'timetable', label: 'Timetable' },
   { slug: 'queue', label: 'Queue' },
   { slug: 'todos', label: 'Todos' },
   { slug: 'artifacts', label: 'Artifacts' },

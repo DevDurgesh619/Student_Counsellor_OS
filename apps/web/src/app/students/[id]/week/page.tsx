@@ -5,31 +5,40 @@ import { useParams, useSearchParams } from 'next/navigation';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { counsellorApi } from '@/lib/api';
 import { TaskCreateForm } from '@/components/task-create-form';
-import { cn } from '@/lib/utils';
+import { WeekGrid } from '@/components/calendar/week-grid';
+import { TaskActionDialog } from '@/components/calendar/task-action-dialog';
+import type { CalendarTask } from '@/components/calendar/task-block';
 
-type Task = {
+type ApiTask = {
   id: string;
   scheduledStart: string;
   scheduledEnd: string;
   subject: string;
   taskTitle: string;
   status: string;
+  supersededAt?: string | null;
 };
 
-function weekBounds(offset = 0): { start: Date; end: Date; days: Date[] } {
+/**
+ * Stable, locale-independent date format. Avoids the SSR/CSR hydration
+ * mismatch you get from `toLocaleDateString()` with no locale — Node defaults
+ * to en-US (MM/DD/YYYY) while the browser uses the user's locale (DD/MM/YYYY
+ * in en-GB / en-IN / etc.), so the server-rendered HTML doesn't match what
+ * React renders client-side.
+ */
+function formatWeekStart(d: Date): string {
+  return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+}
+
+function weekBounds(offset = 0): { start: Date; end: Date } {
   const now = new Date();
-  const day = now.getUTCDay(); // 0 Sun
+  const day = now.getDay(); // 0 Sun
   const monday = new Date(now);
-  monday.setUTCDate(now.getUTCDate() - ((day + 6) % 7) + offset * 7);
-  monday.setUTCHours(0, 0, 0, 0);
-  const days = Array.from({ length: 7 }, (_, i) => {
-    const d = new Date(monday);
-    d.setUTCDate(monday.getUTCDate() + i);
-    return d;
-  });
+  monday.setDate(now.getDate() - ((day + 6) % 7) + offset * 7);
+  monday.setHours(0, 0, 0, 0);
   const end = new Date(monday);
-  end.setUTCDate(monday.getUTCDate() + 7);
-  return { start: monday, end, days };
+  end.setDate(monday.getDate() + 7);
+  return { start: monday, end };
 }
 
 export default function WeekPage() {
@@ -38,9 +47,10 @@ export default function WeekPage() {
   const initialAction = searchParams.get('action');
   const [showCreate, setShowCreate] = useState(initialAction === 'create');
   const [weekOffset, setWeekOffset] = useState(0);
+  const [activeTask, setActiveTask] = useState<CalendarTask | null>(null);
   const qc = useQueryClient();
 
-  const { start, end, days } = useMemo(() => weekBounds(weekOffset), [weekOffset]);
+  const { start, end } = useMemo(() => weekBounds(weekOffset), [weekOffset]);
 
   const { data, isLoading } = useQuery({
     queryKey: ['student-tasks', params.id, start.toISOString(), end.toISOString()],
@@ -48,24 +58,27 @@ export default function WeekPage() {
       counsellorApi.studentTasks(params.id, {
         start: start.toISOString(),
         end: end.toISOString(),
-      }) as Promise<{ data: Task[] }>,
+      }) as Promise<{ data: ApiTask[] }>,
     refetchInterval: 15_000,
     refetchOnWindowFocus: true,
   });
 
-  const tasks = data?.data ?? [];
-
-  // Group tasks by day
-  const tasksByDay = useMemo(() => {
-    const map = new Map<string, Task[]>();
-    days.forEach((d) => map.set(d.toISOString().slice(0, 10), []));
-    for (const t of tasks) {
-      const key = new Date(t.scheduledStart).toISOString().slice(0, 10);
-      const arr = map.get(key);
-      if (arr) arr.push(t);
-    }
-    return map;
-  }, [days, tasks]);
+  // Active-schedule filter — supersededAt-marked rows are historical, and
+  // cancelled/rescheduled rows are off the schedule too (see /timetable/page
+  // for the full rationale).
+  const tasks: CalendarTask[] = useMemo(() => {
+    const rows = data?.data ?? [];
+    return rows
+      .filter((t) => !t.supersededAt && t.status !== 'cancelled' && t.status !== 'rescheduled')
+      .map((t) => ({
+        id: t.id,
+        scheduledStart: t.scheduledStart,
+        scheduledEnd: t.scheduledEnd,
+        subject: t.subject,
+        taskTitle: t.taskTitle,
+        status: t.status as CalendarTask['status'],
+      }));
+  }, [data]);
 
   return (
     <div className="space-y-4">
@@ -78,7 +91,7 @@ export default function WeekPage() {
             ←
           </button>
           <span className="text-sm">
-            Week of {start.toLocaleDateString()}{' '}
+            Week of {formatWeekStart(start)}{' '}
             {weekOffset === 0 && <span className="text-muted-foreground">(this week)</span>}
           </span>
           <button
@@ -117,37 +130,12 @@ export default function WeekPage() {
 
       {isLoading && <p className="text-sm text-muted-foreground">Loading…</p>}
 
-      <div className="grid grid-cols-7 gap-2">
-        {days.map((d) => {
-          const key = d.toISOString().slice(0, 10);
-          const dayTasks = tasksByDay.get(key) ?? [];
-          const isToday = key === new Date().toISOString().slice(0, 10);
-          return (
-            <div
-              key={key}
-              className={cn(
-                'min-h-40 rounded-lg border border-border bg-card p-2',
-                isToday && 'border-primary',
-              )}
-            >
-              <div className="mb-2 text-xs">
-                <div className="font-medium">
-                  {d.toLocaleDateString([], { weekday: 'short' })}
-                </div>
-                <div className="text-muted-foreground">{d.getUTCDate()}</div>
-              </div>
-              <ul className="space-y-1">
-                {dayTasks.map((t) => (
-                  <li key={t.id} className="rounded bg-muted px-2 py-1 text-xs">
-                    <div className="font-medium">{t.subject}</div>
-                    <div className="truncate text-muted-foreground">{t.taskTitle}</div>
-                  </li>
-                ))}
-              </ul>
-            </div>
-          );
-        })}
-      </div>
+      <WeekGrid tasks={tasks} weekStart={start} onTaskClick={setActiveTask} />
+      <TaskActionDialog
+        studentId={params.id}
+        task={activeTask}
+        onClose={() => setActiveTask(null)}
+      />
     </div>
   );
 }

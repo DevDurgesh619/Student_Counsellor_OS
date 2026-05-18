@@ -139,6 +139,16 @@ export const counsellorApi = {
       body,
       idempotencyKey: crypto.randomUUID(),
     }),
+  openRequestInEditor: (id: string) =>
+    api<{
+      conversationId: string;
+      reused: boolean;
+      proposedChangeId?: string;
+      assistantMessageId?: string;
+    }>(`/api/counsellor/change-requests/${id}/open-in-editor`, {
+      method: 'POST',
+      idempotencyKey: crypto.randomUUID(),
+    }),
   createSession: (studentId: string, body: unknown) =>
     api<unknown>(`/api/counsellor/students/${studentId}/sessions`, {
       method: 'POST',
@@ -183,33 +193,19 @@ export const counsellorApi = {
     api<{ data: SessionExtractionRow | null }>(
       `/api/counsellor/sessions/${sessionId}/extraction`,
     ),
-  sessionDraftTasks: (sessionId: string) =>
-    api<{ data: DraftTaskRow[] }>(`/api/counsellor/sessions/${sessionId}/draft-tasks`),
+  sessionPendingChange: (sessionId: string) =>
+    api<{ data: PendingChangeResponse | null }>(
+      `/api/counsellor/sessions/${sessionId}/pending-change`,
+    ),
   runSessionPipeline: (sessionId: string) =>
     api<{ data: { extractionId: string; passABriefId: string | null; draftTaskCount: number; worker4Ran: boolean } }>(
       `/api/counsellor/sessions/${sessionId}/run-pipeline`,
       { method: 'POST', idempotencyKey: crypto.randomUUID() },
     ),
-  bulkDecideDraftTasks: (
-    body: {
-      decisions: Array<{
-        taskId: string;
-        action: 'approve' | 'reject' | 'edit';
-        edits?: Partial<{
-          scheduledStart: string;
-          scheduledEnd: string;
-          taskTitle: string;
-          taskDescription: string | null;
-          subject: string;
-          flexibility: 'fixed' | 'preferred' | 'flexible';
-        }>;
-        notes?: string;
-      }>;
-    },
-  ) =>
-    api<{ data: { approved: number; rejected: number } }>(
-      '/api/counsellor/draft-tasks/bulk-decision',
-      { method: 'POST', body, idempotencyKey: crypto.randomUUID() },
+  decidePendingChange: (sessionId: string, decision: 'approve' | 'reject') =>
+    api<{ data: { decision: 'approve' | 'reject' } }>(
+      `/api/counsellor/sessions/${sessionId}/pending-change/decision`,
+      { method: 'POST', body: { decision }, idempotencyKey: crypto.randomUUID() },
     ),
   upcomingBrief: (studentId: string) =>
     api<{ data: MeetingPrepBriefRow | null; session?: SessionRow }>(
@@ -280,6 +276,37 @@ export const counsellorApi = {
         unassigned: number;
       };
     }>('/api/counsellor/spinach/poll-now', { method: 'POST' }),
+  recentSpinachActivity: () =>
+    api<{
+      lastSyncedAt: string | null;
+      nextScheduledSession: {
+        sessionId: string;
+        studentId: string;
+        studentName: string;
+        scheduledAt: string;
+      } | null;
+      items: Array<{
+        ingestId: string;
+        title: string | null;
+        scheduledAt: string | null;
+        fetchedAt: string;
+        status: 'unassigned' | 'linked' | 'ignored';
+        sessionId: string | null;
+        student: { id: string; fullName: string | null } | null;
+      }>;
+    }>('/api/counsellor/spinach/recent-activity'),
+  refreshStudentSpinach: (studentId: string) =>
+    api<{
+      data: {
+        meetingsFetched: number;
+        sessionsCreated: number;
+        unassigned: number;
+        addedForThisStudent: number;
+      };
+    }>(`/api/counsellor/students/${studentId}/spinach-refresh`, {
+      method: 'POST',
+      idempotencyKey: crypto.randomUUID(),
+    }),
   spinachInboxList: (status: 'unassigned' | 'linked' | 'ignored' = 'unassigned') =>
     api<{ data: SpinachInboxRow[] }>('/api/counsellor/spinach/inbox', { query: { status } }),
   spinachInboxOne: (id: string) =>
@@ -291,6 +318,21 @@ export const counsellorApi = {
     }),
   ignoreSpinachMeeting: (id: string) =>
     api<unknown>(`/api/counsellor/spinach/inbox/${id}/ignore`, { method: 'POST' }),
+  bulkAutoAssignInbox: () =>
+    api<{
+      data: {
+        assigned: number;
+        skipped: number;
+        errors: Array<{ id: string; message: string }>;
+      };
+    }>('/api/counsellor/spinach/inbox/bulk-auto-assign', { method: 'POST' }),
+};
+
+export type MatchCandidate = {
+  studentId: string;
+  fullName: string;
+  confidence: 'high' | 'medium' | 'low';
+  reason: string;
 };
 
 export type SpinachInboxRow = {
@@ -304,6 +346,7 @@ export type SpinachInboxRow = {
   raw: Record<string, unknown> | null;
   status: 'unassigned' | 'linked' | 'ignored';
   linkedSessionId: string | null;
+  suggestions?: MatchCandidate[];
 };
 
 export type SessionRow = {
@@ -357,6 +400,44 @@ export type DraftTaskRow = {
   source: string;
   generatedFromSessionId: string | null;
   flexibility: string;
+};
+
+// Worker 4's draft proposal, served per-session. The `summary` mirrors the
+// timetable-editor's preview shape so the same diff UI can render here.
+export type PendingChangeResponse = {
+  change: {
+    id: string;
+    status: 'draft' | 'active' | 'reverted';
+    source: string;
+    rationale: string | null;
+    createdAt: string;
+  };
+  summary: {
+    added: Array<{
+      id: string;
+      scheduledStart: string;
+      scheduledEnd: string;
+      subject: string;
+      taskTitle: string;
+      taskDescription: string | null;
+      flexibility: string;
+    }>;
+    removed: Array<{
+      id: string;
+      scheduledStart: string;
+      scheduledEnd: string;
+      subject: string;
+      taskTitle: string;
+    }>;
+    moved: Array<{
+      from: { id: string; scheduledStart: string; scheduledEnd: string; subject: string; taskTitle: string };
+      to: { id: string; scheduledStart: string; scheduledEnd: string; subject: string; taskTitle: string };
+    }>;
+    edits: Array<{
+      task: { id: string; subject: string; taskTitle: string };
+      changes: Record<string, unknown>;
+    }>;
+  };
 };
 
 export type MeetingPrepBriefRow = {
@@ -503,6 +584,139 @@ export const assistantApi = {
     api<{ ok: true }>(`/api/counsellor/assistant/conversations/${id}`, { method: 'DELETE' }),
 };
 
+// ─── Timetable editor (Worker 4b) ─────────────────────────────────────────
+
+export type TimetableConversation = {
+  id: string;
+  counsellorId: string;
+  studentId: string;
+  isBootstrap: boolean;
+  title: string | null;
+  startedAt: string;
+  endedAt: string | null;
+};
+
+export type TimetableMessage = {
+  id: string;
+  conversationId: string;
+  role: 'user' | 'assistant' | 'system';
+  content: string;
+  proposedChangeId: string | null;
+  createdAt: string;
+};
+
+export type TimetableChange = {
+  id: string;
+  studentId: string;
+  source: string;
+  status: 'draft' | 'active' | 'reverted';
+  operations: Array<{ op: string; payload: Record<string, unknown> }>;
+  rationale: string | null;
+  appliedAt: string | null;
+  revertedAt: string | null;
+  createdAt: string;
+};
+
+export type ChangeSummary = {
+  added: Array<{
+    id: string;
+    scheduledStart: string;
+    scheduledEnd: string;
+    subject: string;
+    taskTitle: string;
+    status: string;
+  }>;
+  removed: Array<{
+    id: string;
+    scheduledStart: string;
+    scheduledEnd: string;
+    subject: string;
+    taskTitle: string;
+    status: string;
+  }>;
+  moved: Array<{
+    from: { id: string; scheduledStart: string; scheduledEnd: string; subject: string; taskTitle: string };
+    to: { id: string; scheduledStart: string; scheduledEnd: string; subject: string; taskTitle: string };
+  }>;
+  edits: Array<{
+    task: {
+      id: string;
+      scheduledStart: string;
+      subject: string;
+      taskTitle: string;
+    };
+    changes: Record<string, unknown>;
+  }>;
+};
+
+export type ChangeWithSummary = ChangeSummary & { change: TimetableChange };
+
+export const timetableEditorApi = {
+  startConversation: (studentId: string, opts?: { title?: string; isBootstrap?: boolean }) =>
+    api<TimetableConversation>(
+      `/api/counsellor/students/${studentId}/timetable/conversations`,
+      { method: 'POST', body: opts ?? {} },
+    ),
+  listConversations: (studentId: string) =>
+    api<{ data: TimetableConversation[] }>(
+      `/api/counsellor/students/${studentId}/timetable/conversations`,
+    ),
+  history: (cid: string) =>
+    api<{ conversation: TimetableConversation; messages: TimetableMessage[] }>(
+      `/api/counsellor/timetable/conversations/${cid}/messages`,
+    ),
+  send: (
+    cid: string,
+    content: string,
+    images?: Array<{ mediaType: string; data: string }>,
+  ) =>
+    api<{
+      userMessageId: string;
+      assistantMessage?: TimetableMessage;
+      proposedChange?: TimetableChange;
+      error?: string;
+    }>(`/api/counsellor/timetable/conversations/${cid}/messages`, {
+      method: 'POST',
+      body: images?.length ? { content, images } : { content },
+    }),
+  apply: (studentId: string, changeId: string) =>
+    api<{
+      ok: true;
+      changeId: string;
+      appliedNow: boolean;
+      alreadyApplied: boolean;
+      tasksAffected: number;
+      summary: ChangeSummary;
+      change: TimetableChange;
+    }>(`/api/counsellor/students/${studentId}/timetable/changes/${changeId}/apply`, {
+      method: 'POST',
+      body: {},
+    }),
+  revert: (studentId: string, changeId: string) =>
+    api<{
+      ok: true;
+      changeId: string;
+      revertedNow: boolean;
+      alreadyReverted: boolean;
+      tasksRestored: number;
+      tasksCancelled: number;
+      change: TimetableChange;
+    }>(`/api/counsellor/students/${studentId}/timetable/changes/${changeId}/revert`, {
+      method: 'POST',
+      body: {},
+    }),
+  summary: (studentId: string, changeId: string) =>
+    api<ChangeWithSummary>(
+      `/api/counsellor/students/${studentId}/timetable/changes/${changeId}/summary`,
+    ),
+  listChanges: (studentId: string) =>
+    api<{ data: TimetableChange[] }>(
+      `/api/counsellor/students/${studentId}/timetable/changes`,
+    ),
+  deleteConversation: (cid: string) =>
+    api<{ ok: true }>(`/api/counsellor/timetable/conversations/${cid}`, { method: 'DELETE' }),
+};
+
 export type CalendarHealth = {
   status: 'healthy' | 'degraded' | 'failing' | 'auth_required' | 'not_setup';
   lastSyncAt: string | null;
@@ -569,6 +783,8 @@ export type StudentTask = {
   expectedOutput: string | null;
   status: string;
   flexibility: string;
+  recurrenceGroupId?: string | null;
+  supersededAt?: string | null;
 };
 
 export const studentApi = {
@@ -608,7 +824,17 @@ export const studentApi = {
     }),
   artifacts: () => api<{ data: Array<Record<string, unknown> & { id: string; fileType: string; originalFilename: string | null; uploadedAt: string; taskId: string | null }> }>('/api/me/artifacts'),
   changeRequests: () => api<{ data: Array<Record<string, unknown> & { id: string; proposedChange: string; reason: string; status: string; counsellorNotes: string | null; requestedAt: string; decidedAt: string | null }> }>('/api/me/change-requests'),
-  submitChangeRequest: (body: { originalTaskId?: string; patternDescription?: string; proposedChange: string; reason: string }) =>
+  submitChangeRequest: (body: {
+    kind?: 'general' | 'task_change';
+    originalTaskId?: string;
+    scope?: 'single' | 'recurring';
+    targetRecurrenceGroupId?: string;
+    proposedStart?: string;
+    proposedEnd?: string;
+    patternDescription?: string;
+    proposedChange: string;
+    reason: string;
+  }) =>
     api<unknown>('/api/me/change-requests', {
       method: 'POST',
       body,

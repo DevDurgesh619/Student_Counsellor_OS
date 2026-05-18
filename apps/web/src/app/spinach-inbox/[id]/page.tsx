@@ -23,7 +23,7 @@ export default function SpinachInboxDetailPage() {
   const [studentId, setStudentId] = useState<string>('');
 
   const assign = useMutation({
-    mutationFn: () => counsellorApi.assignSpinachMeeting(id, studentId),
+    mutationFn: (sid: string) => counsellorApi.assignSpinachMeeting(id, sid),
     onSuccess: (res) => {
       const sid = res?.data?.sessionId;
       if (sid) router.replace(`/sessions/${sid}`);
@@ -94,8 +94,49 @@ export default function SpinachInboxDetailPage() {
         </section>
       )}
 
+      {(inbox.suggestions?.length ?? 0) > 0 && (
+        <section className="space-y-2 rounded-lg border border-border bg-card p-4">
+          <h3 className="text-sm font-medium">Suggested student</h3>
+          <p className="text-xs text-muted-foreground">
+            Based on attendee emails + meeting title. Click to assign immediately.
+          </p>
+          <ul className="space-y-1.5">
+            {inbox.suggestions!.map((s) => {
+              const tone =
+                s.confidence === 'high'
+                  ? 'border-success/50 bg-success/5'
+                  : s.confidence === 'medium'
+                    ? 'border-warning/50 bg-warning/5'
+                    : 'border-border bg-muted/30';
+              return (
+                <li
+                  key={s.studentId}
+                  className={`flex items-center justify-between gap-2 rounded-md border ${tone} px-3 py-1.5 text-sm`}
+                >
+                  <div>
+                    <p className="font-medium">{s.fullName}</p>
+                    <p className="text-xs text-muted-foreground">
+                      {s.confidence} confidence · {s.reason}
+                    </p>
+                  </div>
+                  <button
+                    onClick={() => assign.mutate(s.studentId)}
+                    disabled={assign.isPending}
+                    className="rounded-md bg-primary px-3 py-1 text-xs text-primary-foreground hover:opacity-90 disabled:opacity-50"
+                  >
+                    {assign.isPending && assign.variables === s.studentId
+                      ? 'Assigning…'
+                      : 'Assign →'}
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+        </section>
+      )}
+
       <section className="space-y-2 rounded-lg border border-border bg-card p-4">
-        <h3 className="text-sm font-medium">Assign to a student</h3>
+        <h3 className="text-sm font-medium">Or pick a different student</h3>
         <select
           value={studentId}
           onChange={(e) => setStudentId(e.target.value)}
@@ -111,7 +152,7 @@ export default function SpinachInboxDetailPage() {
         <div className="flex flex-wrap gap-2">
           <button
             disabled={!studentId || assign.isPending}
-            onClick={() => assign.mutate()}
+            onClick={() => assign.mutate(studentId)}
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:opacity-90 disabled:opacity-50"
           >
             {assign.isPending ? 'Assigning…' : 'Assign + run pipeline'}

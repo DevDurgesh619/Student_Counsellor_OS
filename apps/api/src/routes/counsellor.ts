@@ -7,19 +7,25 @@ import {
   completions,
   counsellors,
   db,
+  recurrenceGroups,
   reviewQueue,
   sessions as sessionsTable,
+  spinachIngestedMeetings,
   studentHistorySummaries,
   students,
   tasks,
+  timetableConversations,
 } from '@wgc/db';
 import { Errors, SubjectSchema, TaskFlexibilitySchema, TaskSourceSchema } from '@wgc/shared';
 import type { AppEnv } from '../app.js';
 import { requireRole } from '../middleware/auth.js';
 import { idempotency } from '../middleware/idempotency.js';
 import { enqueueTaskSync } from '../lib/sync-outbox.js';
-import { backfillStudentSpinach } from '../lib/spinach-poll.js';
+import { backfillStudentSpinach, pollOneCounsellor } from '../lib/spinach-poll.js';
+import { markStudentBriefsForRefresh } from '../lib/meeting-prep.js';
+import { logger } from '../logger.js';
 import { listSummaryVersions } from '../lib/student-history.js';
+import { runEditorTurn } from './timetable-editor.js';
 
 export const counsellorScopedRoutes = new Hono<AppEnv>();
 
@@ -209,6 +215,113 @@ counsellorScopedRoutes.get('/students-overview', async (c) => {
 });
 
 /**
+ * GET /api/counsellor/spinach/recent-activity
+ *
+ * Single endpoint powering the counsellor home page's "Recent Spinach
+ * activity" panel. Without this the counsellor only sees results (new
+ * sessions on a student) — never the act of syncing, so silent successes
+ * read as failures. Returns the last 20 ingested meetings + the next
+ * scheduled session + the last-sync watermark.
+ */
+counsellorScopedRoutes.get('/spinach/recent-activity', async (c) => {
+  const auth = requireRole(c, 'counsellor');
+  const now = new Date();
+  const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+
+  const counsellorRow = (
+    await db
+      .select({ spinachLastSyncedAt: counsellors.spinachLastSyncedAt })
+      .from(counsellors)
+      .where(eq(counsellors.id, auth.subjectId))
+      .limit(1)
+  )[0];
+
+  // LEFT JOIN sessions so matched items carry the student + session id.
+  // Unmatched (status='unassigned') rows still surface with student=null
+  // so the counsellor can jump to the inbox.
+  const ingestedRows = await db
+    .select({
+      ingestId: spinachIngestedMeetings.id,
+      title: spinachIngestedMeetings.title,
+      scheduledAt: spinachIngestedMeetings.scheduledAt,
+      fetchedAt: spinachIngestedMeetings.fetchedAt,
+      status: spinachIngestedMeetings.status,
+      sessionId: spinachIngestedMeetings.linkedSessionId,
+      studentId: sessionsTable.studentId,
+    })
+    .from(spinachIngestedMeetings)
+    .leftJoin(
+      sessionsTable,
+      eq(sessionsTable.id, spinachIngestedMeetings.linkedSessionId),
+    )
+    .where(
+      and(
+        eq(spinachIngestedMeetings.counsellorId, auth.subjectId),
+        gte(spinachIngestedMeetings.fetchedAt, sevenDaysAgo),
+      ),
+    )
+    .orderBy(desc(spinachIngestedMeetings.fetchedAt))
+    .limit(20);
+
+  // Resolve student names in one shot.
+  const studentIds = [
+    ...new Set(ingestedRows.map((r) => r.studentId).filter((x): x is string => Boolean(x))),
+  ];
+  const studentRows = studentIds.length
+    ? await db
+        .select({ id: students.id, fullName: students.fullName })
+        .from(students)
+        .where(inArray(students.id, studentIds))
+    : [];
+  const studentById = new Map(studentRows.map((s) => [s.id, s.fullName]));
+
+  // Next scheduled session across all assigned students.
+  const next = (
+    await db
+      .select({
+        id: sessionsTable.id,
+        studentId: sessionsTable.studentId,
+        scheduledAt: sessionsTable.scheduledAt,
+        studentName: students.fullName,
+      })
+      .from(sessionsTable)
+      .innerJoin(students, eq(students.id, sessionsTable.studentId))
+      .where(
+        and(
+          eq(students.counsellorId, auth.subjectId),
+          eq(sessionsTable.status, 'scheduled'),
+          gte(sessionsTable.scheduledAt, now),
+        ),
+      )
+      .orderBy(asc(sessionsTable.scheduledAt))
+      .limit(1)
+  )[0];
+
+  return c.json({
+    lastSyncedAt: counsellorRow?.spinachLastSyncedAt ?? null,
+    nextScheduledSession: next
+      ? {
+          sessionId: next.id,
+          studentId: next.studentId,
+          studentName: next.studentName,
+          scheduledAt: next.scheduledAt,
+        }
+      : null,
+    items: ingestedRows.map((r) => ({
+      ingestId: r.ingestId,
+      title: r.title,
+      scheduledAt: r.scheduledAt,
+      fetchedAt: r.fetchedAt,
+      status: r.status,
+      sessionId: r.sessionId,
+      student: r.studentId
+        ? { id: r.studentId, fullName: studentById.get(r.studentId) ?? null }
+        : null,
+    })),
+  });
+});
+
+/**
  * Counsellor-scoped student detail — same as /api/students/:id but explicit
  * about the counsellor scoping (cleaner for the web app to consume).
  */
@@ -381,6 +494,13 @@ counsellorScopedRoutes.patch('/students/:studentId/sessions/:sessionId', async (
     })
     .where(eq(sessionsTable.id, sessionId))
     .returning();
+  // Reschedule → bump the brief refresh signal so Pass B regenerates at
+  // the new T-24h window with up-to-date context.
+  if (patch.scheduledAt) {
+    markStudentBriefsForRefresh(studentId).catch((err) =>
+      logger.warn({ err, studentId }, 'markStudentBriefsForRefresh failed (non-fatal)'),
+    );
+  }
   return c.json(updated[0]);
 });
 
@@ -403,6 +523,67 @@ const SpinachBackfillSchema = z.object({
  * returns the counts (imported / skipped / failed) so the UI can render
  * a friendly summary.
  */
+/**
+ * POST /api/counsellor/students/:id/spinach-refresh
+ *
+ * Counsellor-triggered focused poll. Runs `pollOneCounsellor` (which is
+ * counsellor-wide because that's what Spinach's MCP supports) and reports
+ * how many of the new sessions landed on THIS student specifically. Used
+ * by the "Refresh from Spinach" button on the student Sessions tab.
+ *
+ * Rate-limited per (counsellor, student) — at most one call per 30s,
+ * because the Spinach API itself has per-second limits and counsellors
+ * may double-click. Cheap in-memory dedup; if we ever multi-instance
+ * this we'd need a shared store, but at our scale this is fine.
+ */
+const spinachRefreshTimes = new Map<string, number>();
+counsellorScopedRoutes.post('/students/:id/spinach-refresh', async (c) => {
+  const auth = requireRole(c, 'counsellor');
+  const studentId = c.req.param('id');
+  await assertCounsellorOwnsStudent(auth.subjectId, studentId);
+
+  const key = `${auth.subjectId}:${studentId}`;
+  const last = spinachRefreshTimes.get(key);
+  if (last && Date.now() - last < 30_000) {
+    throw Errors.conflict(
+      'SPINACH_REFRESH_RATE_LIMITED',
+      'Please wait a few seconds between refreshes.',
+    );
+  }
+  spinachRefreshTimes.set(key, Date.now());
+
+  // Count sessions BEFORE the poll, so we can derive how many landed for
+  // this student in the call. Cheap — limit to the last 24h.
+  const sinceCutoff = new Date(Date.now() - 24 * 60 * 60 * 1000);
+  const before = await db
+    .select({ id: sessionsTable.id })
+    .from(sessionsTable)
+    .where(
+      and(
+        eq(sessionsTable.studentId, studentId),
+        gte(sessionsTable.scheduledAt, sinceCutoff),
+      ),
+    );
+  const beforeIds = new Set(before.map((r) => r.id));
+
+  const result = await pollOneCounsellor(auth.subjectId);
+
+  const after = await db
+    .select({ id: sessionsTable.id })
+    .from(sessionsTable)
+    .where(
+      and(
+        eq(sessionsTable.studentId, studentId),
+        gte(sessionsTable.scheduledAt, sinceCutoff),
+      ),
+    );
+  const addedForThisStudent = after.filter((r) => !beforeIds.has(r.id)).length;
+
+  return c.json({
+    data: { ...result, addedForThisStudent },
+  });
+});
+
 counsellorScopedRoutes.post('/students/:id/spinach-backfill', idempotency, async (c) => {
   const auth = requireRole(c, 'counsellor');
   const studentId = c.req.param('id');
@@ -444,7 +625,51 @@ counsellorScopedRoutes.get('/students/:id/change-requests', async (c) => {
     .from(changeRequests)
     .where(and(...conds))
     .orderBy(desc(changeRequests.requestedAt));
-  return c.json({ data: rows });
+
+  // Hydrate target task + recurrence group for task_change rows so the
+  // counsellor UI can show "Math AI Wed 8am · recurring" without a second
+  // roundtrip per request.
+  const taskIds = rows
+    .filter((r) => r.kind === 'task_change' && r.originalTaskId)
+    .map((r) => r.originalTaskId as string);
+  const groupIds = rows
+    .filter((r) => r.targetRecurrenceGroupId)
+    .map((r) => r.targetRecurrenceGroupId as string);
+  const taskRows = taskIds.length
+    ? await db
+        .select({
+          id: tasks.id,
+          subject: tasks.subject,
+          taskTitle: tasks.taskTitle,
+          scheduledStart: tasks.scheduledStart,
+          scheduledEnd: tasks.scheduledEnd,
+          status: tasks.status,
+          recurrenceGroupId: tasks.recurrenceGroupId,
+        })
+        .from(tasks)
+        .where(inArray(tasks.id, taskIds))
+    : [];
+  const groupRows = groupIds.length
+    ? await db
+        .select({
+          id: recurrenceGroups.id,
+          ruleJson: recurrenceGroups.ruleJson,
+          startsOn: recurrenceGroups.startsOn,
+          endsOn: recurrenceGroups.endsOn,
+        })
+        .from(recurrenceGroups)
+        .where(inArray(recurrenceGroups.id, groupIds))
+    : [];
+  const taskById = new Map(taskRows.map((t) => [t.id, t]));
+  const groupById = new Map(groupRows.map((g) => [g.id, g]));
+  const data = rows.map((r) => ({
+    ...r,
+    targetTask: r.originalTaskId ? (taskById.get(r.originalTaskId) ?? null) : null,
+    targetRecurrenceGroup: r.targetRecurrenceGroupId
+      ? (groupById.get(r.targetRecurrenceGroupId) ?? null)
+      : null,
+  }));
+  return c.json({ data });
 });
 
 const ChangeRequestDecisionSchema = z.object({
@@ -505,6 +730,201 @@ counsellorScopedRoutes.post('/change-requests/:id/decision', idempotency, async 
 
   return c.json(updated[0]);
 });
+
+/**
+ * POST /api/counsellor/change-requests/:id/open-in-editor
+ *
+ * Bridges a structured task_change request into the conversational timetable
+ * editor: creates a conversation (stamped with seed_request_id), seeds it
+ * with a counsellor-authored prose turn summarising the request, runs
+ * Worker 4b to generate a draft proposal, and marks the request approved.
+ * Idempotent — re-invocations on a request that already has
+ * linked_conversation_id return the existing conversation id instead of
+ * spawning a duplicate.
+ */
+counsellorScopedRoutes.post(
+  '/change-requests/:id/open-in-editor',
+  idempotency,
+  async (c) => {
+    const auth = requireRole(c, 'counsellor');
+    const id = c.req.param('id');
+
+    const cr = (
+      await db.select().from(changeRequests).where(eq(changeRequests.id, id)).limit(1)
+    )[0];
+    if (!cr) throw Errors.notFound('change_request', id);
+    await assertCounsellorOwnsStudent(auth.subjectId, cr.studentId);
+    if (cr.kind !== 'task_change') {
+      throw Errors.conflict(
+        'CHANGE_REQUEST_NOT_TASK_CHANGE',
+        'Only task_change requests can be opened in the editor. General requests must be handled manually.',
+      );
+    }
+    // Idempotency: same request opened twice (double-click, retry) returns
+    // the existing conversation. The status check below skips because cr
+    // is already 'approved' after a successful first call.
+    if (cr.linkedConversationId) {
+      return c.json({ conversationId: cr.linkedConversationId, reused: true });
+    }
+    if (cr.status !== 'pending') {
+      throw Errors.conflict(
+        'CHANGE_REQUEST_ALREADY_DECIDED',
+        `change_request is already ${cr.status}`,
+      );
+    }
+
+    // Build the seed prose. We resolve the target task + recurrence rule
+    // here so the LLM doesn't have to infer the time-window from history
+    // alone — it gets a self-contained brief.
+    const task = cr.originalTaskId
+      ? (
+          await db
+            .select()
+            .from(tasks)
+            .where(eq(tasks.id, cr.originalTaskId))
+            .limit(1)
+        )[0]
+      : undefined;
+    const group = cr.targetRecurrenceGroupId
+      ? (
+          await db
+            .select()
+            .from(recurrenceGroups)
+            .where(eq(recurrenceGroups.id, cr.targetRecurrenceGroupId))
+            .limit(1)
+        )[0]
+      : task?.recurrenceGroupId
+        ? (
+            await db
+              .select()
+              .from(recurrenceGroups)
+              .where(eq(recurrenceGroups.id, task.recurrenceGroupId))
+              .limit(1)
+          )[0]
+        : undefined;
+    const student = (
+      await db.select().from(students).where(eq(students.id, cr.studentId)).limit(1)
+    )[0];
+    const tz = student?.timezone || 'Asia/Kolkata';
+
+    const taskLine = task
+      ? `${task.subject} · ${task.taskTitle} · ${formatTaskTime(task.scheduledStart, task.scheduledEnd, tz)}`
+      : '(no task linked)';
+    const recurrenceLine = group
+      ? `${describeRule(group.ruleJson)} from ${group.startsOn} to ${group.endsOn}`
+      : 'one-off';
+    const proposedLine =
+      cr.proposedStart && cr.proposedEnd
+        ? formatTaskTime(cr.proposedStart, cr.proposedEnd, tz)
+        : 'unspecified — counsellor to decide';
+    const seedBody = [
+      `Student request (auto-seeded from request ${id}):`,
+      '',
+      `Target task: ${taskLine} (timezone ${tz})`,
+      `Recurrence: ${recurrenceLine}`,
+      `Scope requested: ${cr.scope ?? 'unspecified'}`,
+      `Proposed new slot: ${proposedLine}`,
+      `Student's words: "${cr.proposedChange}"`,
+      `Reason: "${cr.reason}"`,
+      '',
+      "Please propose the minimal operations to fulfil this. If scope=recurring, edit_recurrence; if scope=single, move_task / cancel_task / create_task as needed.",
+    ].join('\n');
+
+    // Create the conversation BEFORE marking the request approved. If the
+    // worker fails the conversation persists (counsellor can continue
+    // manually) but the request stays pending so the queue still flags it.
+    const titleHint = task
+      ? `Request: ${task.subject} ${cr.scope ?? ''}`.trim()
+      : `Request: ${cr.proposedChange.slice(0, 40)}`;
+    const conv = (
+      await db
+        .insert(timetableConversations)
+        .values({
+          counsellorId: auth.subjectId,
+          studentId: cr.studentId,
+          title: titleHint,
+          isBootstrap: false,
+          seedRequestId: id,
+        })
+        .returning()
+    )[0]!;
+
+    const result = await runEditorTurn({
+      conv,
+      counsellorId: auth.subjectId,
+      content: seedBody,
+    });
+
+    if (result.error) {
+      // Worker died — keep the conversation + seed message so the counsellor
+      // can retry inside the chat, but DO NOT flip the request to approved.
+      // We still record the conversation linkage so the next open-in-editor
+      // call is idempotent (reuses the same conversation).
+      await db
+        .update(changeRequests)
+        .set({ linkedConversationId: conv.id })
+        .where(eq(changeRequests.id, id));
+      throw Errors.internal(result.error);
+    }
+
+    // Worker succeeded (with or without operations). Mark approved and
+    // link the conversation; resolved_at stays NULL until Apply.
+    await db
+      .update(changeRequests)
+      .set({
+        status: 'approved',
+        decidedAt: new Date(),
+        decidedBy: auth.subjectId,
+        linkedConversationId: conv.id,
+      })
+      .where(eq(changeRequests.id, id));
+
+    // Resolve any review_queue rows tied to this request (matches the
+    // plain-decision endpoint's behaviour).
+    await db
+      .update(reviewQueue)
+      .set({
+        status: 'resolved',
+        resolvedAt: new Date(),
+        resolvedBy: auth.subjectId,
+        resolutionNotes: 'change_request opened in editor',
+      })
+      .where(and(eq(reviewQueue.referenceId, id), eq(reviewQueue.type, 'change_request')));
+
+    return c.json({
+      conversationId: conv.id,
+      reused: false,
+      proposedChangeId: result.proposedChange?.id,
+      assistantMessageId: result.assistantMessage?.id,
+    });
+  },
+);
+
+function describeRule(rule: { frequency: string; days_of_week: number[]; start_time: string; duration_min: number }): string {
+  const dayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  const days = rule.days_of_week.map((d) => dayNames[d] ?? d).join('/');
+  return `${rule.frequency} ${days} at ${rule.start_time} (${rule.duration_min}min)`;
+}
+
+function formatTaskTime(start: Date, end: Date, tz: string): string {
+  const fmt = new Intl.DateTimeFormat('en-US', {
+    timeZone: tz,
+    weekday: 'short',
+    year: 'numeric',
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true,
+  });
+  const endFmt = new Intl.DateTimeFormat('en-US', {
+    timeZone: tz,
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true,
+  });
+  return `${fmt.format(start)} – ${endFmt.format(end)}`;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Settings

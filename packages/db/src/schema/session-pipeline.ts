@@ -88,6 +88,11 @@ export const meetingPrepBriefs = pgTable('meeting_prep_briefs', {
   finalContent: text('final_content'),
   counsellorEditedAt: timestamp('counsellor_edited_at', { withTimezone: true }),
   status: text('status').notNull().default('pass_a_only'),
+  // "Regenerate Pass B by this time." Pass A sets it = next-session - 24h;
+  // session reschedule recomputes; relevant student activity bumps it to
+  // now()+5min. The 15-min cron picks up rows where refresh_at <= now()
+  // AND not yet regenerated since, runs Pass B, clears refresh_at.
+  refreshAt: timestamp('refresh_at', { withTimezone: true }),
   createdAt: createdAt(),
   updatedAt: updatedAt(),
 });

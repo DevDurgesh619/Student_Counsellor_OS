@@ -16,6 +16,13 @@ export type AICallParams<T> = {
   sessionId?: string;
   /** Optional model override; falls back to the prompt's frontmatter. */
   model?: string;
+  /**
+   * Optional images attached to the user message — sent as Anthropic
+   * vision content blocks alongside the rendered prompt text. `mediaType`
+   * must be one of: image/jpeg, image/png, image/gif, image/webp. `data`
+   * is the raw base64 (no data: URL prefix).
+   */
+  images?: Array<{ mediaType: string; data: string }>;
 };
 
 export type AICallResult<T> = {
@@ -72,11 +79,35 @@ export class AIClient {
           : `${rendered}\n\nYour previous response did not match the required JSON schema. ` +
             `Error: ${lastError}\n\nPlease produce a corrected response. Output only the JSON object, no commentary.`;
 
+      // Vision: if images were attached, send a multipart user message.
+      // Otherwise keep the plain string for backwards compatibility.
+      const userContent =
+        params.images && params.images.length > 0
+          ? [
+              ...params.images.map(
+                (img) =>
+                  ({
+                    type: 'image' as const,
+                    source: {
+                      type: 'base64' as const,
+                      media_type: img.mediaType as
+                        | 'image/jpeg'
+                        | 'image/png'
+                        | 'image/gif'
+                        | 'image/webp',
+                      data: img.data,
+                    },
+                  }),
+              ),
+              { type: 'text' as const, text: messageContent },
+            ]
+          : messageContent;
+
       const response = await this.client.messages.create({
         model,
         max_tokens: prompt.maxTokens,
         temperature: prompt.temperature,
-        messages: [{ role: 'user', content: messageContent }],
+        messages: [{ role: 'user', content: userContent }],
       });
 
       lastLatencyMs = Date.now() - t0;
@@ -104,7 +135,14 @@ export class AIClient {
 
       const parsed = tryParseJson(lastRaw);
       if (parsed === null) {
-        lastError = 'Response is not valid JSON';
+        // Most common cause of invalid JSON: the model hit max_tokens
+        // mid-output and the JSON is literally cut off. Detect that by
+        // comparing tokens_output to the configured cap and surface a
+        // specific error so the caller doesn't blame "the LLM was weird".
+        const truncated = lastTokensOutput >= prompt.maxTokens - 5;
+        lastError = truncated
+          ? `Response truncated at max_tokens=${prompt.maxTokens} (output_tokens=${lastTokensOutput}). The proposal is too large for one response — raise max_tokens in the prompt frontmatter, or ask the LLM to produce a smaller proposal.`
+          : 'Response is not valid JSON';
         continue;
       }
       const validated = params.outputSchema.safeParse(parsed);

@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import { z } from 'zod';
-import { and, asc, desc, eq, gte, lte } from 'drizzle-orm';
+import { and, asc, desc, eq, gte, isNull, lte, ne } from 'drizzle-orm';
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import {
   artifacts,
@@ -17,7 +17,6 @@ import { loadEnv } from '@wgc/config';
 import type { AppEnv } from '../app.js';
 import { requireRole } from '../middleware/auth.js';
 import { idempotency } from '../middleware/idempotency.js';
-
 export const studentScopedRoutes = new Hono<AppEnv>();
 
 const ARTIFACT_BUCKET = 'artifacts';
@@ -44,7 +43,17 @@ studentScopedRoutes.get('/tasks', async (c) => {
   const startDate = c.req.query('startDate');
   const endDate = c.req.query('endDate');
 
-  const conds = [eq(tasks.studentId, auth.subjectId)];
+  // Active-schedule predicate (mirrors the engine + counsellor view):
+  // `superseded_at IS NULL AND status NOT IN ('cancelled','rescheduled')`.
+  // Without this, a counsellor who deletes a task would leave the row
+  // visible on the student's today/week view until the page is closed —
+  // the student would then "complete" a task that no longer exists.
+  const conds = [
+    eq(tasks.studentId, auth.subjectId),
+    isNull(tasks.supersededAt),
+    ne(tasks.status, 'cancelled'),
+    ne(tasks.status, 'rescheduled'),
+  ];
   if (date) {
     const day = new Date(`${date}T00:00:00.000Z`);
     const next = new Date(day.getTime() + 86_400_000);
@@ -212,21 +221,70 @@ studentScopedRoutes.get('/artifacts', async (c) => {
 
 // ─── Change requests ─────────────────────────────────────────────────────────
 
-const ChangeRequestSchema = z.object({
-  originalTaskId: z.string().uuid().optional(),
-  patternDescription: z.string().optional(),
-  proposedChange: z.string().min(1),
-  reason: z.string().min(1),
-});
+const ChangeRequestSchema = z
+  .object({
+    kind: z.enum(['general', 'task_change']).default('general'),
+    // task_change fields (cross-validated below):
+    originalTaskId: z.string().uuid().optional(),
+    scope: z.enum(['single', 'recurring']).optional(),
+    targetRecurrenceGroupId: z.string().uuid().optional(),
+    proposedStart: z.string().datetime().optional(),
+    proposedEnd: z.string().datetime().optional(),
+    // shared:
+    patternDescription: z.string().optional(),
+    proposedChange: z.string().min(1),
+    reason: z.string().min(1),
+  })
+  .refine((d) => d.kind === 'general' || (d.originalTaskId && d.scope), {
+    message: 'task_change requires originalTaskId + scope',
+  })
+  .refine(
+    (d) =>
+      !d.proposedStart ||
+      (d.proposedEnd && new Date(d.proposedEnd) > new Date(d.proposedStart)),
+    { message: 'proposedEnd must be after proposedStart' },
+  );
 
 studentScopedRoutes.post('/change-requests', idempotency, async (c) => {
   const auth = requireRole(c, 'student');
   const body = ChangeRequestSchema.parse(await c.req.json());
+
+  // Duplicate guard. One pending task_change per (student, task) — without
+  // this a student could drag-drop the same block five times and create five
+  // pending requests, all of which surface in the counsellor's queue as
+  // duplicates. Cleared automatically when the existing request flips off
+  // 'pending' (approve, reject, expire, open-in-editor).
+  if (body.kind === 'task_change' && body.originalTaskId) {
+    const existing = await db
+      .select({ id: changeRequests.id })
+      .from(changeRequests)
+      .where(
+        and(
+          eq(changeRequests.studentId, auth.subjectId),
+          eq(changeRequests.originalTaskId, body.originalTaskId),
+          eq(changeRequests.status, 'pending'),
+        ),
+      )
+      .limit(1);
+    if (existing[0]) {
+      throw Errors.conflict(
+        'CHANGE_REQUEST_EXISTS',
+        'You already have a pending request to change this task. Wait for your counsellor to decide on the existing one.',
+        { existingRequestId: existing[0].id },
+      );
+    }
+  }
+
   const inserted = await db
     .insert(changeRequests)
     .values({
       studentId: auth.subjectId,
+      kind: body.kind,
       originalTaskId: body.originalTaskId ?? null,
+      scope: body.scope ?? null,
+      targetRecurrenceGroupId: body.targetRecurrenceGroupId ?? null,
+      proposedStart: body.proposedStart ? new Date(body.proposedStart) : null,
+      proposedEnd: body.proposedEnd ? new Date(body.proposedEnd) : null,
       patternDescription: body.patternDescription ?? null,
       proposedChange: body.proposedChange,
       reason: body.reason,

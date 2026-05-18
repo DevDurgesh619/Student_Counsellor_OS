@@ -175,6 +175,98 @@ export async function matchMeeting(
 }
 
 /**
+ * Ranked-candidates view for the inbox UI. Where `matchMeeting` decides
+ * "exactly one student or nothing", this returns the top 3 plausible
+ * matches with a confidence label and a short human-readable reason — so
+ * the counsellor's inbox shows "Suggested: Hetvika · high · email match
+ * [Assign]" and triage drops from "read 46 meetings + pick a student
+ * from a dropdown of 30+" to one click per match.
+ */
+export type MatchCandidate = {
+  studentId: string;
+  fullName: string;
+  confidence: 'high' | 'medium' | 'low';
+  reason: string;
+};
+
+export async function rankCandidates(
+  counsellorId: string,
+  meeting: SpinachMeetingSummary,
+  full: SpinachMeetingFull | null,
+): Promise<MatchCandidate[]> {
+  const roster = await loadActiveRoster(counsellorId);
+  if (roster.length === 0) return [];
+
+  const emails = meetingEmails(meeting, full);
+  const haystack = meetingNameHaystack(meeting, full);
+  const title = (meeting.title ?? full?.title ?? '').toLowerCase();
+
+  // Aggregate score + best-reason per student.
+  type Scored = { score: number; reason: string };
+  const byId = new Map<string, Scored>();
+  const bump = (sid: string, score: number, reason: string) => {
+    const prev = byId.get(sid);
+    if (!prev || score > prev.score) byId.set(sid, { score, reason });
+  };
+
+  for (const s of roster) {
+    // High-confidence signals (score 1.0) — exact identifiers.
+    if (s.email && emails.includes(s.email.toLowerCase())) {
+      bump(s.id, 1.0, 'student email in attendees');
+      continue;
+    }
+    const parentMatch = (s.parentContacts ?? []).find(
+      (p) => p.email && emails.includes(p.email.toLowerCase()),
+    );
+    if (parentMatch) {
+      bump(s.id, 1.0, 'parent email in attendees');
+      continue;
+    }
+    // Full-name in title is high-confidence too.
+    const tokens = nameTokens(s.fullName);
+    const fullNameLower = s.fullName.toLowerCase();
+    if (title.includes(fullNameLower)) {
+      bump(s.id, 1.0, 'full name in meeting title');
+      continue;
+    }
+
+    // Medium-confidence (0.7) — first-name in title or attendee names.
+    const firstName = tokens[0];
+    if (firstName && title.includes(firstName)) {
+      bump(s.id, 0.7, `first name "${firstName}" in title`);
+      continue;
+    }
+    if (firstName && haystack.includes(firstName)) {
+      bump(s.id, 0.7, `first name "${firstName}" in attendees`);
+      continue;
+    }
+
+    // Low-confidence (0.4) — any 3+ char name token anywhere in metadata.
+    const tokenHit = tokens.find((t) => haystack.includes(t));
+    if (tokenHit) {
+      bump(s.id, 0.4, `name token "${tokenHit}" in metadata`);
+    }
+  }
+
+  const studentById = new Map(roster.map((s) => [s.id, s]));
+  return [...byId.entries()]
+    .map(([studentId, { score, reason }]) => ({
+      studentId,
+      fullName: studentById.get(studentId)?.fullName ?? '(unknown)',
+      confidence: (score >= 1.0 ? 'high' : score >= 0.7 ? 'medium' : 'low') as
+        | 'high'
+        | 'medium'
+        | 'low',
+      reason,
+    }))
+    .sort((a, b) => {
+      const order = { high: 3, medium: 2, low: 1 } as const;
+      return order[b.confidence] - order[a.confidence];
+    })
+    .slice(0, 3);
+}
+
+/**
  * Targeted single-student match — used by the backfill flow when we already
  * know which student we're importing for. Returns true if any signal
  * (in the active mode) points to this specific student.

@@ -85,6 +85,27 @@
       "when": 1763404800000,
       "tag": "0012_counsellor_todos_archived",
       "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1763491200000,
+      "tag": "0013_timetable_changes",
+      "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "7",
+      "when": 1763577600000,
+      "tag": "0014_request_editor_bridge",
+      "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "7",
+      "when": 1763664000000,
+      "tag": "0015_brief_refresh_at",
+      "breakpoints": true
     }
   ]
 }
